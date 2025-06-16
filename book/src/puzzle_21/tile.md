@@ -1,4 +1,4 @@
-# ⚡ Tile - Memory-Efficient Tiled Processing
+# Tile - Memory-Efficient Tiled Processing
 
 ## Overview
 
@@ -20,7 +20,7 @@ In this puzzle, you'll master:
 - **Performance trade-offs** between parallelism and memory efficiency
 
 The same mathematical operation as elementwise:
-\\[\Large \text{out}[i] = a[i] + b[i]\\]
+\\[\Large \text{output}[i] = a[i] + b[i]\\]
 
 But with a completely different execution strategy optimized for memory hierarchy.
 
@@ -35,9 +35,9 @@ But with a completely different execution strategy optimized for memory hierarch
 ## Code to complete
 
 ```mojo
-{{#include ../../../problems/p20/p20.mojo:tiled_elementwise_add}}
+{{#include ../../../problems/p21/p21.mojo:tiled_elementwise_add}}
 ```
-<a href="{{#include ../_includes/repo_url.md}}/blob/main/problems/p20/p20.mojo" class="filename">View full file: problems/p20/p20.mojo</a>
+<a href="{{#include ../_includes/repo_url.md}}/blob/main/problems/p21/p21.mojo" class="filename">View full file: problems/p21/p21.mojo</a>
 
 <details>
 <summary><strong>Tips</strong></summary>
@@ -57,7 +57,7 @@ Check out the [LayoutTensor `.tile` documentation](https://docs.modular.com/mojo
 
 ```mojo
 tile_id = indices[0]  # Each thread gets one tile to process
-out_tile = out.tile[tile_size](tile_id)
+out_tile = output.tile[tile_size](tile_id)
 a_tile = a.tile[tile_size](tile_id)
 b_tile = b.tile[tile_size](tile_id)
 ```
@@ -109,14 +109,14 @@ To test your solution, run the following command in your terminal:
   <div class="tab-content">
 
 ```bash
-uv run poe p20 --tiled
+uv run poe p21 --tiled
 ```
 
   </div>
   <div class="tab-content">
 
 ```bash
-pixi run p20 --tiled
+pixi run p21 --tiled
 ```
 
   </div>
@@ -146,7 +146,7 @@ expected: HostBuffer([1.0, 5.0, 9.0, ..., 4085.0, 4089.0, 4093.0])
 <summary></summary>
 
 ```mojo
-{{#include ../../../solutions/p20/p20.mojo:tiled_elementwise_add_solution}}
+{{#include ../../../solutions/p21/p21.mojo:tiled_elementwise_add_solution}}
 ```
 
 <div class="solution-explanation">
@@ -171,7 +171,7 @@ Tiling represents a fundamental shift in how we think about parallel processing:
 
 ```mojo
 tile_id = indices[0]
-out_tile = out.tile[tile_size](tile_id)
+out_tile = output.tile[tile_size](tile_id)
 a_tile = a.tile[tile_size](tile_id)
 b_tile = b.tile[tile_size](tile_id)
 ```
@@ -314,7 +314,7 @@ The choice between elementwise and tiled patterns depends on your specific workl
 
 Now that you understand both elementwise and tiled patterns:
 
-- **[🔧 Vectorization](./vectorize.md)**: Fine-grained control over SIMD operations
+- **[Vectorization](./vectorize.md)**: Fine-grained control over SIMD operations
 - **[🧠 GPU Threading vs SIMD](./gpu-thread-vs-simd.md)**: Understanding the execution hierarchy
 - **[📊 Benchmarking](./benchmarking.md)**: Performance analysis and optimization
 

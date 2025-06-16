@@ -1,4 +1,4 @@
-# ⚡ warp.sum() Essentials - Warp-Level Dot Product
+# warp.sum() Essentials - Warp-Level Dot Product
 
 Implement the dot product we saw in [puzzle 10](../puzzle_10/puzzle_10.md) using Mojo's warp operations to replace complex shared memory patterns with simple function calls. Each warp lane will process one element and use `warp.sum()` to combine results automatically, demonstrating how warp programming transforms GPU synchronization.
 
@@ -14,7 +14,7 @@ In this puzzle, you'll master:
 - **Lane ID management** and conditional writes
 
 The mathematical operation is a dot product (inner product):
-\\[\Large \text{out}[0] = \sum_{i=0}^{N-1} a[i] \times b[i]\\]
+\\[\Large \text{output}[0] = \sum_{i=0}^{N-1} a[i] \times b[i]\\]
 
 But the implementation teaches fundamental patterns for all warp-level GPU programming in Mojo.
 
@@ -31,7 +31,7 @@ But the implementation teaches fundamental patterns for all warp-level GPU progr
 Recall the complex approach from `p10.mojo` that required shared memory, barriers, and tree reduction:
 
 ```mojo
-{{#include ../../../problems/p21/p21.mojo:traditional_approach_from_p10}}
+{{#include ../../../problems/p22/p22.mojo:traditional_approach_from_p10}}
 ```
 
 **What makes this complex:**
@@ -51,14 +51,14 @@ This works, but it's verbose, error-prone, and requires deep understanding of GP
   <div class="tab-content">
 
 ```bash
-uv run poe p21 --traditional
+uv run poe p22 --traditional
 ```
 
   </div>
   <div class="tab-content">
 
 ```bash
-pixi run p21 --traditional
+pixi run p22 --traditional
 ```
 
   </div>
@@ -71,10 +71,10 @@ pixi run p21 --traditional
 Transform the complex traditional approach into a simple warp kernel using `warp_sum()`:
 
 ```mojo
-{{#include ../../../problems/p21/p21.mojo:simple_warp_kernel}}
+{{#include ../../../problems/p22/p22.mojo:simple_warp_kernel}}
 ```
 
-<a href="{{#include ../_includes/repo_url.md}}/blob/main/problems/p21/p21.mojo" class="filename">View full file: problems/p21/p21.mojo</a>
+<a href="{{#include ../_includes/repo_url.md}}/blob/main/problems/p22/p22.mojo" class="filename">View full file: problems/p22/p22.mojo</a>
 
 <details>
 <summary><strong>Tips</strong></summary>
@@ -86,7 +86,7 @@ Transform the complex traditional approach into a simple warp kernel using `warp
 You need to complete the `simple_warp_dot_product` function with **6 lines or fewer**:
 
 ```mojo
-fn simple_warp_dot_product[...](out, a, b):
+fn simple_warp_dot_product[...](output, a, b):
     global_i = block_dim.x * block_idx.x + thread_idx.x
     # FILL IN (6 lines at most)
 ```
@@ -121,7 +121,7 @@ total = warp_sum(partial_product)
 ### 4. **Writing the result**
 ```mojo
 if lane_id() == 0:
-    out[0] = total
+    output[0] = total
 ```
 
 **Why only lane 0?** All lanes have the same `total` value after `warp_sum()`, but we only want to write once to avoid race conditions.
@@ -140,14 +140,14 @@ if lane_id() == 0:
   <div class="tab-content">
 
 ```bash
-uv run poe p21 --kernel
+uv run poe p22 --kernel
 ```
 
   </div>
   <div class="tab-content">
 
 ```bash
-pixi run p21 --kernel
+pixi run p22 --kernel
 ```
 
   </div>
@@ -171,7 +171,7 @@ expected: 10416.0
 <summary></summary>
 
 ```mojo
-{{#include ../../../solutions/p21/p21.mojo:simple_warp_kernel_solution}}
+{{#include ../../../solutions/p22/p22.mojo:simple_warp_kernel_solution}}
 ```
 
 <div class="solution-explanation">
@@ -213,7 +213,7 @@ All lanes receive → total = 10416.0 (broadcast result)
 Now implement the same warp dot product using Mojo's functional programming patterns:
 
 ```mojo
-{{#include ../../../problems/p21/p21.mojo:functional_warp_approach}}
+{{#include ../../../problems/p22/p22.mojo:functional_warp_approach}}
 ```
 
 <details>
@@ -258,10 +258,10 @@ else:
 total = warp_sum(partial_product)
 
 if lane_id() == 0:
-    out.store[1](0, 0, total)
+    output.store[1](0, 0, total)
 ```
 
-**Storage pattern:** `out.store[1](0, 0, total)` stores 1 element at position (0, 0) in the output tensor.
+**Storage pattern:** `output.store[1](0, 0, total)` stores 1 element at position (0, 0) in the output tensor.
 
 **Same warp logic:** `warp_sum()` and lane 0 writing work identically in functional approach.
 
@@ -288,14 +288,14 @@ warp_size = WARP_SIZE         # 32 (NVIDIA) or 64 (AMD)
   <div class="tab-content">
 
 ```bash
-uv run poe p21 --functional
+uv run poe p22 --functional
 ```
 
   </div>
   <div class="tab-content">
 
 ```bash
-pixi run p21 --functional
+pixi run p22 --functional
 ```
 
   </div>
@@ -319,7 +319,7 @@ expected: 10416.0
 <summary></summary>
 
 ```mojo
-{{#include ../../../solutions/p21/p21.mojo:functional_warp_approach_solution}}
+{{#include ../../../solutions/p22/p22.mojo:functional_warp_approach_solution}}
 ```
 
 <div class="solution-explanation">
@@ -362,14 +362,14 @@ Run comprehensive benchmarks to see how warp operations scale:
   <div class="tab-content">
 
 ```bash
-uv run poe p21 --benchmark
+uv run poe p22 --benchmark
 ```
 
   </div>
   <div class="tab-content">
 
 ```bash
-pixi run p21 --benchmark
+pixi run p22 --benchmark
 ```
 
   </div>
@@ -474,7 +474,7 @@ Benchmarks completed!
 
 Once you've mastered warp sum operations, you're ready for:
 
-- **[📊 When to Use Warp Programming](./warp_extra.md)**: Strategic decision framework for warp vs traditional approaches
+- **[When to Use Warp Programming](./warp_extra.md)**: Strategic decision framework for warp vs traditional approaches
 - **Advanced warp operations**: `shuffle_idx()`, `shuffle_down()`, `prefix_sum()` for complex communication patterns
 - **Multi-warp algorithms**: Combining warp operations with block-level synchronization
 - **Part VII: Memory Coalescing**: Optimizing memory access patterns for maximum bandwidth

@@ -32,8 +32,13 @@ fn prefix_sum_simple[
 
     offset = 1
     for i in range(Int(log2(Scalar[dtype](TPB)))):
+        current_val = shared[0]
         if local_i >= offset and local_i < size:
-            shared[local_i] += shared[local_i - offset]
+            current_val = shared[local_i - offset]  # read
+
+        barrier()
+        if local_i >= offset and local_i < size:
+            shared[local_i] += current_val
 
         barrier()
         offset *= 2
@@ -70,7 +75,9 @@ fn prefix_sum_local_phase[
     # Load data into shared memory
     # Example with SIZE_2=15, TPB=8, BLOCKS=2:
     # Block 0 shared mem: [0,1,2,3,4,5,6,7]
-    # Block 1 shared mem: [8,9,10,11,12,13,14,0]  (last value padded with 0)
+    # Block 1 shared mem: [8,9,10,11,12,13,14,uninitialized]
+    # Note: The last position remains uninitialized since global_i >= size,
+    # but this is safe because that thread doesn't participate in computation
     if global_i < size:
         shared[local_i] = a[global_i]
 
@@ -87,8 +94,14 @@ fn prefix_sum_local_phase[
     # Block 1 follows same pattern to get [8,17,27,38,50,63,77,...]
     offset = 1
     for i in range(Int(log2(Scalar[dtype](TPB)))):
+        var current_val = shared[0]
         if local_i >= offset and local_i < TPB:
-            shared[local_i] += shared[local_i - offset]
+            current_val = shared[local_i - offset]  # read
+
+        barrier()
+        if local_i >= offset and local_i < TPB:
+            shared[local_i] += current_val  # write
+
         barrier()
         offset *= 2
 
@@ -177,11 +190,6 @@ def main():
                 grid_dim=BLOCKS_PER_GRID_2,
                 block_dim=THREADS_PER_BLOCK_2,
             )
-
-            # Wait for all `blocks` to complete with using host `ctx.synchronize()`
-            # Note this is in contrast with using `barrier()` in the kernel
-            # which is a synchronization point for all threads in the same block and not across blocks.
-            ctx.synchronize()
 
             # Phase 2: Add block sums
             ctx.enqueue_function[prefix_sum_block_sum_phase[extended_layout]](

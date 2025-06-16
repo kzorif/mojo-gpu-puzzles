@@ -24,7 +24,7 @@ GPU Device
 │   └── Block 2 (independent group)
 ```
 
-💡 **Note**: While this Part focuses on functional patterns, **warp-level programming** and advanced GPU memory management will be covered in detail in **[Part VI](../puzzle_21/puzzle_21.md)**.
+💡 **Note**: While this Part focuses on functional patterns, **warp-level programming** and advanced GPU memory management will be covered in detail in **[Part VI](../puzzle_22/puzzle_22.md)**.
 
 **What Mojo abstracts for you:**
 - **Grid/Block configuration**: Automatically calculated based on problem size
@@ -38,10 +38,10 @@ Each GPU thread can process multiple data elements simultaneously using **SIMD (
 
 ```mojo
 // Within one GPU thread:
-a_simd = a.load[simd_width](idx, 0)    // Load 4 floats simultaneously
-b_simd = b.load[simd_width](idx, 0)    // Load 4 floats simultaneously
-result = a_simd + b_simd               // Add 4 pairs simultaneously
-out.store[simd_width](idx, 0, result)  // Store 4 results simultaneously
+a_simd = a.load[simd_width](idx, 0)      # Load 4 floats simultaneously
+b_simd = b.load[simd_width](idx, 0)      # Load 4 floats simultaneously
+result = a_simd + b_simd                 # Add 4 pairs simultaneously
+output.store[simd_width](idx, 0, result) # Store 4 results simultaneously
 ```
 
 ## Pattern comparison and thread-to-work mapping

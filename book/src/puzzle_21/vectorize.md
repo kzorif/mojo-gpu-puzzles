@@ -1,4 +1,4 @@
-# 🔧 Vectorization - Fine-Grained SIMD Control
+# Vectorization - Fine-Grained SIMD Control
 
 ## Overview
 
@@ -21,7 +21,7 @@ In this puzzle, you'll master:
 - **Performance trade-offs** between manual control and safety
 
 The same mathematical operation as before:
-\\[\Large \text{out}[i] = a[i] + b[i]\\]
+\\[\Large \text{output}[i] = a[i] + b[i]\\]
 
 But with sophisticated vectorization strategies for maximum performance.
 
@@ -38,9 +38,9 @@ But with sophisticated vectorization strategies for maximum performance.
 ### Code to complete
 
 ```mojo
-{{#include ../../../problems/p20/p20.mojo:manual_vectorized_tiled_elementwise_add}}
+{{#include ../../../problems/p21/p21.mojo:manual_vectorized_tiled_elementwise_add}}
 ```
-<a href="{{#include ../_includes/repo_url.md}}/blob/main/problems/p20/p20.mojo" class="filename">View full file: problems/p20/p20.mojo</a>
+<a href="{{#include ../_includes/repo_url.md}}/blob/main/problems/p21/p21.mojo" class="filename">View full file: problems/p21/p21.mojo</a>
 
 <details>
 <summary><strong>Tips</strong></summary>
@@ -61,8 +61,8 @@ This calculates the exact global position for each SIMD vector within the chunk.
 
 ### 3. **Direct tensor access**
 ```mojo
-a_vec = a.load[simd_width](global_start, 0)  # Load from global tensor
-out.store[simd_width](global_start, 0, ret)  # Store to global tensor
+a_vec = a.load[simd_width](global_start, 0)     # Load from global tensor
+output.store[simd_width](global_start, 0, ret)  # Store to global tensor
 ```
 Note: Access the original tensors, not the tile views.
 
@@ -84,14 +84,14 @@ Note: Access the original tensors, not the tile views.
   <div class="tab-content">
 
 ```bash
-uv run poe p20 --manual-vectorized
+uv run poe p21 --manual-vectorized
 ```
 
   </div>
   <div class="tab-content">
 
 ```bash
-pixi run p20 --manual-vectorized
+pixi run p21 --manual-vectorized
 ```
 
   </div>
@@ -121,7 +121,7 @@ expected: HostBuffer([1.0, 5.0, 9.0, ..., 4085.0, 4089.0, 4093.0])
 <summary></summary>
 
 ```mojo
-{{#include ../../../solutions/p20/p20.mojo:manual_vectorized_tiled_elementwise_add_solution}}
+{{#include ../../../solutions/p21/p21.mojo:manual_vectorized_tiled_elementwise_add_solution}}
 ```
 
 <div class="solution-explanation">
@@ -186,9 +186,9 @@ for i in range(tile_size):  # i = 0, 1, 2, ..., 31
 ### Code to complete
 
 ```mojo
-{{#include ../../../problems/p20/p20.mojo:vectorize_within_tiles_elementwise_add}}
+{{#include ../../../problems/p21/p21.mojo:vectorize_within_tiles_elementwise_add}}
 ```
-<a href="{{#include ../_includes/repo_url.md}}/blob/main/problems/p20/p20.mojo" class="filename">View full file: problems/p20/p20.mojo</a>
+<a href="{{#include ../_includes/repo_url.md}}/blob/main/problems/p21/p21.mojo" class="filename">View full file: problems/p21/p21.mojo</a>
 
 <details>
 <summary><strong>Tips</strong></summary>
@@ -237,14 +237,14 @@ This automatically handles the vectorization loop with the provided SIMD width.
   <div class="tab-content">
 
 ```bash
-uv run poe p20 --vectorized
+uv run poe p21 --vectorized
 ```
 
   </div>
   <div class="tab-content">
 
 ```bash
-pixi run p20 --vectorized
+pixi run p21 --vectorized
 ```
 
   </div>
@@ -274,7 +274,7 @@ expected: HostBuffer([1.0, 5.0, 9.0, ..., 4085.0, 4089.0, 4093.0])
 <summary></summary>
 
 ```mojo
-{{#include ../../../solutions/p20/p20.mojo:vectorize_within_tiles_elementwise_add_solution}}
+{{#include ../../../solutions/p21/p21.mojo:vectorize_within_tiles_elementwise_add_solution}}
 ```
 
 <div class="solution-explanation">
