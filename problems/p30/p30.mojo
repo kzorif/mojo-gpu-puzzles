@@ -1,391 +1,157 @@
-from gpu import thread_idx, block_dim, block_idx
+from gpu import thread_idx, block_idx, block_dim, grid_dim, barrier
 from gpu.host import DeviceContext
+from gpu.memory import async_copy_wait_all
 from layout import Layout, LayoutTensor
 from layout.tensor_builder import LayoutTensorBuild as tb
-from sys import argv
-from testing import assert_almost_equal
-from benchmark import Bench, BenchConfig, Bencher, BenchId, keep
+from layout.layout_tensor import copy_dram_to_sram_async
+from sys import argv, info
+from testing import assert_equal, assert_almost_equal
 
-alias SIZE = 16 * 1024 * 1024  # 16M elements - large enough to show memory patterns
-alias THREADS_PER_BLOCK = (1024, 1)  # Max CUDA threads per block
-alias BLOCKS_PER_GRID = (SIZE // 1024, 1)  # Enough blocks to cover all elements
+# ANCHOR: async_copy_overlap_convolution
+alias VECTOR_SIZE = 16384
+alias CONV_TILE_SIZE = 256
+alias KERNEL_SIZE = 5
+alias HALO_SIZE = KERNEL_SIZE // 2  # Halo elements needed for boundary
+alias BUFFER_SIZE = CONV_TILE_SIZE + 2 * HALO_SIZE  # Include halo for boundary conditions
+alias BLOCKS_PER_GRID_ASYNC = (
+    VECTOR_SIZE + CONV_TILE_SIZE - 1
+) // CONV_TILE_SIZE
+alias THREADS_PER_BLOCK_ASYNC = 256
 alias dtype = DType.float32
-alias layout = Layout.row_major(SIZE)
+alias layout_async = Layout.row_major(VECTOR_SIZE)
 
 
-# ANCHOR: kernel1
-fn kernel1[
-    layout: Layout
+fn async_copy_overlap_convolution[
+    dtype: DType, layout: Layout
 ](
     output: LayoutTensor[mut=True, dtype, layout],
-    a: LayoutTensor[mut=False, dtype, layout],
-    b: LayoutTensor[mut=False, dtype, layout],
-    size: Int,
+    input: LayoutTensor[mut=False, dtype, layout],
+    kernel: LayoutTensor[mut=False, dtype, Layout.row_major(KERNEL_SIZE)],
 ):
-    i = block_dim.x * block_idx.x + thread_idx.x
-    if i < size:
-        output[i] = a[i] + b[i]
+    """Demonstrates async copy operations building on p14 patterns.
+
+    This shows how to use copy_dram_to_sram_async and async_copy_wait_all
+    for efficient memory transfers, extending the patterns from p14 matmul.
+    """
+
+    # Shared memory buffers (like p14, but without .fill(0) to avoid race)
+    input_shared = tb[dtype]().row_major[CONV_TILE_SIZE]().shared().alloc()
+    kernel_shared = tb[dtype]().row_major[KERNEL_SIZE]().shared().alloc()
+
+    # FILL IN HERE (roughly 19 lines)
 
 
-# ANCHOR_END: kernel1
+# ANCHOR_END: async_copy_overlap_convolution
 
 
-# ANCHOR: kernel2
-fn kernel2[
-    layout: Layout
-](
-    output: LayoutTensor[mut=True, dtype, layout],
-    a: LayoutTensor[mut=False, dtype, layout],
-    b: LayoutTensor[mut=False, dtype, layout],
-    size: Int,
-):
-    tid = block_idx.x * block_dim.x + thread_idx.x
-    stride = 512
-
-    i = tid
-    while i < size:
-        output[i] = a[i] + b[i]
-        i += stride
-
-
-# ANCHOR_END: kernel2
-
-
-# ANCHOR: kernel3
-fn kernel3[
-    layout: Layout
-](
-    output: LayoutTensor[mut=True, dtype, layout],
-    a: LayoutTensor[mut=False, dtype, layout],
-    b: LayoutTensor[mut=False, dtype, layout],
-    size: Int,
-):
-    tid = block_idx.x * block_dim.x + thread_idx.x
-    total_threads = (SIZE // 1024) * 1024
-
-    for step in range(0, size, total_threads):
-        forward_i = step + tid
-        if forward_i < size:
-            reverse_i = size - 1 - forward_i
-            output[reverse_i] = a[reverse_i] + b[reverse_i]
-
-
-# ANCHOR_END: kernel3
-
-
-@parameter
-@always_inline
-fn benchmark_kernel1_parameterized[test_size: Int](mut b: Bencher) raises:
-    @parameter
-    @always_inline
-    fn kernel1_workflow(ctx: DeviceContext) raises:
-        alias layout = Layout.row_major(test_size)
-        out = ctx.enqueue_create_buffer[dtype](test_size).enqueue_fill(0)
-        a = ctx.enqueue_create_buffer[dtype](test_size).enqueue_fill(0)
-        b_buf = ctx.enqueue_create_buffer[dtype](test_size).enqueue_fill(0)
-
-        with a.map_to_host() as a_host, b_buf.map_to_host() as b_host:
-            for i in range(test_size):
-                a_host[i] = Float32(i + 1)
-                b_host[i] = Float32(i + 2)
-
-        out_tensor = LayoutTensor[mut=True, dtype, layout](out.unsafe_ptr())
-        a_tensor = LayoutTensor[mut=False, dtype, layout](a.unsafe_ptr())
-        b_tensor = LayoutTensor[mut=False, dtype, layout](b_buf.unsafe_ptr())
-
-        ctx.enqueue_function[kernel1[layout]](
-            out_tensor,
-            a_tensor,
-            b_tensor,
-            test_size,
-            grid_dim=BLOCKS_PER_GRID,
-            block_dim=THREADS_PER_BLOCK,
-        )
-        keep(out.unsafe_ptr())
-        ctx.synchronize()
-
-    bench_ctx = DeviceContext()
-    b.iter_custom[kernel1_workflow](bench_ctx)
-
-
-@parameter
-@always_inline
-fn benchmark_kernel2_parameterized[test_size: Int](mut b: Bencher) raises:
-    @parameter
-    @always_inline
-    fn kernel2_workflow(ctx: DeviceContext) raises:
-        alias layout = Layout.row_major(test_size)
-        out = ctx.enqueue_create_buffer[dtype](test_size).enqueue_fill(0)
-        a = ctx.enqueue_create_buffer[dtype](test_size).enqueue_fill(0)
-        b_buf = ctx.enqueue_create_buffer[dtype](test_size).enqueue_fill(0)
-
-        with a.map_to_host() as a_host, b_buf.map_to_host() as b_host:
-            for i in range(test_size):
-                a_host[i] = Float32(i + 1)
-                b_host[i] = Float32(i + 2)
-
-        out_tensor = LayoutTensor[mut=True, dtype, layout](out.unsafe_ptr())
-        a_tensor = LayoutTensor[mut=False, dtype, layout](a.unsafe_ptr())
-        b_tensor = LayoutTensor[mut=False, dtype, layout](b_buf.unsafe_ptr())
-
-        ctx.enqueue_function[kernel2[layout]](
-            out_tensor,
-            a_tensor,
-            b_tensor,
-            test_size,
-            grid_dim=BLOCKS_PER_GRID,
-            block_dim=THREADS_PER_BLOCK,
-        )
-        keep(out.unsafe_ptr())
-        ctx.synchronize()
-
-    bench_ctx = DeviceContext()
-    b.iter_custom[kernel2_workflow](bench_ctx)
-
-
-@parameter
-@always_inline
-fn benchmark_kernel3_parameterized[test_size: Int](mut b: Bencher) raises:
-    @parameter
-    @always_inline
-    fn kernel3_workflow(ctx: DeviceContext) raises:
-        alias layout = Layout.row_major(test_size)
-        out = ctx.enqueue_create_buffer[dtype](test_size).enqueue_fill(0)
-        a = ctx.enqueue_create_buffer[dtype](test_size).enqueue_fill(0)
-        b_buf = ctx.enqueue_create_buffer[dtype](test_size).enqueue_fill(0)
-
-        with a.map_to_host() as a_host, b_buf.map_to_host() as b_host:
-            for i in range(test_size):
-                a_host[i] = Float32(i + 1)
-                b_host[i] = Float32(i + 2)
-
-        out_tensor = LayoutTensor[mut=True, dtype, layout](out.unsafe_ptr())
-        a_tensor = LayoutTensor[mut=False, dtype, layout](a.unsafe_ptr())
-        b_tensor = LayoutTensor[mut=False, dtype, layout](b_buf.unsafe_ptr())
-
-        ctx.enqueue_function[kernel3[layout]](
-            out_tensor,
-            a_tensor,
-            b_tensor,
-            test_size,
-            grid_dim=BLOCKS_PER_GRID,
-            block_dim=THREADS_PER_BLOCK,
-        )
-        keep(out.unsafe_ptr())
-        ctx.synchronize()
-
-    bench_ctx = DeviceContext()
-    b.iter_custom[kernel3_workflow](bench_ctx)
-
-
-def test_kernel1():
-    """Test kernel 1."""
-    print("Testing kernel 1...")
+def test_async_copy_overlap_convolution():
+    """Test async copy overlap with 1D convolution."""
     with DeviceContext() as ctx:
-        out = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-        a = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-        b = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
+        input_buf = ctx.enqueue_create_buffer[dtype](VECTOR_SIZE).enqueue_fill(
+            0
+        )
+        output_buf = ctx.enqueue_create_buffer[dtype](VECTOR_SIZE).enqueue_fill(
+            0
+        )
+        kernel_buf = ctx.enqueue_create_buffer[dtype](KERNEL_SIZE).enqueue_fill(
+            0
+        )
 
-        # Initialize test data
-        with a.map_to_host() as a_host, b.map_to_host() as b_host:
-            for i in range(SIZE):
-                a_host[i] = Float32(i + 1)
-                b_host[i] = Float32(i + 2)
+        # Create test data: consecutive integers [1, 2, 3, ..., VECTOR_SIZE]
+        with input_buf.map_to_host() as input_host:
+            for i in range(VECTOR_SIZE):
+                input_host[i] = Float32(i + 1)
 
-        # Create LayoutTensors
-        out_tensor = LayoutTensor[mut=True, dtype, layout](out.unsafe_ptr())
-        a_tensor = LayoutTensor[mut=False, dtype, layout](a.unsafe_ptr())
-        b_tensor = LayoutTensor[mut=False, dtype, layout](b.unsafe_ptr())
+        # Create test kernel: [1, 2, 3, 4, 5]
+        with kernel_buf.map_to_host() as kernel_host:
+            for i in range(KERNEL_SIZE):
+                kernel_host[i] = Float32(i + 1)
 
-        ctx.enqueue_function[kernel1[layout]](
-            out_tensor,
-            a_tensor,
-            b_tensor,
-            SIZE,
-            grid_dim=BLOCKS_PER_GRID,
-            block_dim=THREADS_PER_BLOCK,
+        input_tensor = LayoutTensor[mut=False, dtype, layout_async](
+            input_buf.unsafe_ptr()
+        )
+        output_tensor = LayoutTensor[mut=True, dtype, layout_async](
+            output_buf.unsafe_ptr()
+        )
+        kernel_tensor = LayoutTensor[
+            mut=False, dtype, Layout.row_major(KERNEL_SIZE)
+        ](kernel_buf.unsafe_ptr())
+
+        ctx.enqueue_function[
+            async_copy_overlap_convolution[dtype, layout_async]
+        ](
+            output_tensor,
+            input_tensor,
+            kernel_tensor,
+            grid_dim=(BLOCKS_PER_GRID_ASYNC, 1),
+            block_dim=(THREADS_PER_BLOCK_ASYNC, 1),
         )
 
         ctx.synchronize()
 
-        # Verify results
-        with out.map_to_host() as out_host, a.map_to_host() as a_host, b.map_to_host() as b_host:
-            for i in range(10):  # Check first 10
-                expected = a_host[i] + b_host[i]
-                actual = out_host[i]
-                assert_almost_equal(expected, actual)
+        # Verify convolution results
+        with output_buf.map_to_host() as output_host:
+            with input_buf.map_to_host() as input_host:
+                print(
+                    "Async copy overlap convolution - verifying first 10"
+                    " values:"
+                )
 
-        print("✅ Kernel 1 test passed")
+                var success = True
+                for i in range(min(10, VECTOR_SIZE)):
+                    var expected_val: Float32 = 0
 
+                    # Match implementation logic: boundary elements copy input, center elements get convolution
+                    var local_i_in_tile = i % CONV_TILE_SIZE
+                    if (
+                        local_i_in_tile >= HALO_SIZE
+                        and local_i_in_tile < CONV_TILE_SIZE - HALO_SIZE
+                    ):
+                        # Center elements: apply convolution
+                        for k in range(KERNEL_SIZE):
+                            var input_idx = i + k - HALO_SIZE
+                            if input_idx >= 0 and input_idx < VECTOR_SIZE:
+                                expected_val += input_host[input_idx] * (k + 1)
+                    else:
+                        # Boundary elements: copy input
+                        expected_val = input_host[i]
 
-def test_kernel2():
-    """Test kernel 2."""
-    print("Testing kernel 2...")
-    with DeviceContext() as ctx:
-        out = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-        a = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-        b = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
+                    actual = output_host[i]
+                    print(
+                        "  Index",
+                        i,
+                        ": input=",
+                        input_host[i],
+                        ", output=",
+                        actual,
+                        ", expected=",
+                        expected_val,
+                    )
 
-        # Initialize test data
-        with a.map_to_host() as a_host, b.map_to_host() as b_host:
-            for i in range(SIZE):
-                a_host[i] = Float32(i + 1)
-                b_host[i] = Float32(i + 2)
+                    if abs(actual - expected_val) > 0.01:
+                        print("Mismatch at index", i)
+                        success = False
+                        break
 
-        # Create LayoutTensors
-        out_tensor = LayoutTensor[mut=True, dtype, layout](out.unsafe_ptr())
-        a_tensor = LayoutTensor[mut=False, dtype, layout](a.unsafe_ptr())
-        b_tensor = LayoutTensor[mut=False, dtype, layout](b.unsafe_ptr())
-
-        ctx.enqueue_function[kernel2[layout]](
-            out_tensor,
-            a_tensor,
-            b_tensor,
-            SIZE,
-            grid_dim=BLOCKS_PER_GRID,
-            block_dim=THREADS_PER_BLOCK,
-        )
-
-        ctx.synchronize()
-
-        # Verify results
-        var processed = 0
-        with out.map_to_host() as out_host, a.map_to_host() as a_host, b.map_to_host() as b_host:
-            for i in range(SIZE):
-                if out_host[i] != 0:  # This element was processed
-                    expected = a_host[i] + b_host[i]
-                    actual = out_host[i]
-                    assert_almost_equal(expected, actual)
-                    processed += 1
-
-        print("✅ Kernel 2 test passed,", processed, "elements processed")
-
-
-def test_kernel3():
-    """Test kernel 3."""
-    print("Testing kernel 3...")
-    with DeviceContext() as ctx:
-        out = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-        a = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-        b = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-
-        # Initialize test data
-        with a.map_to_host() as a_host, b.map_to_host() as b_host:
-            for i in range(SIZE):
-                a_host[i] = Float32(i + 1)
-                b_host[i] = Float32(i + 2)
-
-        # Create LayoutTensors
-        out_tensor = LayoutTensor[mut=True, dtype, layout](out.unsafe_ptr())
-        a_tensor = LayoutTensor[mut=False, dtype, layout](a.unsafe_ptr())
-        b_tensor = LayoutTensor[mut=False, dtype, layout](b.unsafe_ptr())
-
-        ctx.enqueue_function[kernel3[layout]](
-            out_tensor,
-            a_tensor,
-            b_tensor,
-            SIZE,
-            grid_dim=BLOCKS_PER_GRID,
-            block_dim=THREADS_PER_BLOCK,
-        )
-
-        ctx.synchronize()
-
-        # Verify results
-        with out.map_to_host() as out_host, a.map_to_host() as a_host, b.map_to_host() as b_host:
-            for i in range(SIZE):
-                expected = a_host[i] + b_host[i]
-                actual = out_host[i]
-                assert_almost_equal(expected, actual)
-
-        print("✅ Kernel 3 test passed")
+                if success:
+                    print("Async copy overlap convolution test PASSED!")
+                else:
+                    print("Async copy overlap convolution test FAILED!")
 
 
 def main():
-    """Run the memory access pattern tests."""
-    args = argv()
-    if len(args) < 2:
-        print("Usage: mojo p30.mojo <flags>")
-        print("  Flags:")
-        print("    --kernel1     Test kernel 1")
-        print("    --kernel2     Test kernel 2")
-        print("    --kernel3     Test kernel 3")
-        print("    --all         Test all kernels")
-        print("    --benchmark   Run benchmarks for all kernels")
+    """Run memory fence tests based on command line arguments."""
+    if len(argv()) != 1:
+        print("Usage: p25.mojo")
         return
 
-    # Parse flags
-    run_kernel1 = False
-    run_kernel2 = False
-    run_kernel3 = False
-    run_all = False
-    run_benchmark = False
-
-    for i in range(1, len(args)):
-        arg = args[i]
-        if arg == "--kernel1":
-            run_kernel1 = True
-        elif arg == "--kernel2":
-            run_kernel2 = True
-        elif arg == "--kernel3":
-            run_kernel3 = True
-        elif arg == "--all":
-            run_all = True
-        elif arg == "--benchmark":
-            run_benchmark = True
-        else:
-            print("Unknown flag:", arg)
-            print(
-                "Valid flags: --kernel1, --kernel2, --kernel3, --all,"
-                " --benchmark"
-            )
-            return
-
-    print("MEMORY ACCESS PATTERN MYSTERY")
-    print("================================")
-    print("Vector size:", SIZE, "elements")
-    print(
-        "Grid config:",
-        BLOCKS_PER_GRID[0],
-        "blocks x",
-        THREADS_PER_BLOCK[0],
-        "threads",
-    )
-
-    if run_all:
-        print("\nTesting all kernels...")
-        test_kernel1()
-        test_kernel2()
-        test_kernel3()
-
-    elif run_benchmark:
-        print("\nRunning Kernel Performance Benchmarks...")
-        print("Use nsys/ncu to profile these for detailed analysis!")
-        print("-" * 50)
-
-        bench = Bench()
-
-        print("Benchmarking Kernel 1")
-        bench.bench_function[benchmark_kernel1_parameterized[SIZE]](
-            BenchId("kernel1")
-        )
-
-        print("Benchmarking Kernel 2")
-        bench.bench_function[benchmark_kernel2_parameterized[SIZE]](
-            BenchId("kernel2")
-        )
-
-        print("Benchmarking Kernel 3")
-        bench.bench_function[benchmark_kernel3_parameterized[SIZE]](
-            BenchId("kernel3")
-        )
-
-        bench.dump_report()
-    else:
-        # Run individual tests
-        if run_kernel1:
-            test_kernel1()
-        if run_kernel2:
-            test_kernel2()
-        if run_kernel3:
-            test_kernel3()
+    print("Puzzle 25: Async Memory Operations & Copy Overlap")
+    print("=" * 50)
+    print("VECTOR_SIZE:", VECTOR_SIZE)
+    print("CONV_TILE_SIZE:", CONV_TILE_SIZE)
+    print("KERNEL_SIZE:", KERNEL_SIZE)
+    print("HALO_SIZE:", HALO_SIZE)
+    print("BUFFER_SIZE:", BUFFER_SIZE)
+    print("BLOCKS_PER_GRID_ASYNC:", BLOCKS_PER_GRID_ASYNC)
+    print("THREADS_PER_BLOCK_ASYNC:", THREADS_PER_BLOCK_ASYNC)
+    test_async_copy_overlap_convolution()

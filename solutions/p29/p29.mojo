@@ -1,403 +1,482 @@
-from gpu import thread_idx, block_idx, block_dim, barrier
-from gpu.sync import (
-    mbarrier_init,
-    mbarrier_arrive,
-    mbarrier_test_wait,
-)
+from gpu import thread_idx, block_idx, block_dim, grid_dim, barrier
+from os.atomic import Atomic
+from gpu.warp import WARP_SIZE
+from gpu import block
 from gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 from layout.tensor_builder import LayoutTensorBuild as tb
-from layout.layout_tensor import copy_dram_to_sram_async
-from sys import sizeof, argv, info
-from testing import assert_true, assert_almost_equal
+from sys import argv
+from testing import assert_equal
+from math import floor
 
-alias TPB = 256  # Threads per block for pipeline stages
-alias SIZE = 1024  # Image size (1D for simplicity)
-alias BLOCKS_PER_GRID = (4, 1)
-alias THREADS_PER_BLOCK = (TPB, 1)
+alias SIZE = 128
+alias TPB = 128
+alias NUM_BINS = 8
+alias in_layout = Layout.row_major(SIZE)
+alias out_layout = Layout.row_major(1)
 alias dtype = DType.float32
-alias layout = Layout.row_major(SIZE)
-
-# Multi-stage processing configuration
-alias STAGE1_THREADS = TPB // 2
-alias STAGE2_THREADS = TPB // 2
-alias BLUR_RADIUS = 2
 
 
-# ANCHOR: multi_stage_pipeline_solution
-fn multi_stage_image_blur_pipeline[
-    layout: Layout
+# ANCHOR: block_sum_dot_product_solution
+fn block_sum_dot_product[
+    in_layout: Layout, out_layout: Layout, tpb: Int
 ](
-    output: LayoutTensor[mut=True, dtype, layout],
-    input: LayoutTensor[mut=False, dtype, layout],
+    output: LayoutTensor[mut=True, dtype, out_layout],
+    a: LayoutTensor[mut=False, dtype, in_layout],
+    b: LayoutTensor[mut=False, dtype, in_layout],
     size: Int,
 ):
-    """Multi-stage image blur pipeline with barrier coordination.
-
-    Stage 1 (threads 0-127): Load input data and apply 1.1x preprocessing
-    Stage 2 (threads 128-255): Apply 5-point blur with BLUR_RADIUS=2
-    Stage 3 (all threads): Final neighbor smoothing and output
-    """
-
-    # Shared memory buffers for pipeline stages
-    input_shared = tb[dtype]().row_major[TPB]().shared().alloc()
-    blur_shared = tb[dtype]().row_major[TPB]().shared().alloc()
+    """Dot product using block.sum() - convenience function like warp.sum()!
+    Replaces manual shared memory + barriers + tree reduction with one line."""
 
     global_i = block_dim.x * block_idx.x + thread_idx.x
     local_i = thread_idx.x
 
-    # Stage 1: Load and preprocess (threads 0-127)
-    if local_i < STAGE1_THREADS:
-        if global_i < size:
-            input_shared[local_i] = input[global_i] * 1.1
-            # Each thread loads 2 elements
-            if local_i + STAGE1_THREADS < size:
-                input_shared[local_i + STAGE1_THREADS] = (
-                    input[global_i + STAGE1_THREADS] * 1.1
-                )
-        else:
-            # Zero-padding for out-of-bounds
-            input_shared[local_i] = 0.0
-            if local_i + STAGE1_THREADS < TPB:
-                input_shared[local_i + STAGE1_THREADS] = 0.0
-
-    barrier()  # Wait for Stage 1 completion
-
-    # Stage 2: Apply blur (threads 128-255)
-    if local_i >= STAGE1_THREADS:
-        blur_idx = local_i - STAGE1_THREADS
-        var blur_sum: Scalar[dtype] = 0.0
-        blur_count = 0
-
-        # 5-point blur kernel
-        for offset in range(-BLUR_RADIUS, BLUR_RADIUS + 1):
-            sample_idx = blur_idx + offset
-            if sample_idx >= 0 and sample_idx < TPB:
-                blur_sum += rebind[Scalar[dtype]](input_shared[sample_idx])
-                blur_count += 1
-
-        if blur_count > 0:
-            blur_shared[blur_idx] = blur_sum / blur_count
-        else:
-            blur_shared[blur_idx] = 0.0
-
-        # Process second element
-        second_idx = blur_idx + STAGE1_THREADS
-        if second_idx < TPB:
-            blur_sum = 0.0
-            blur_count = 0
-            for offset in range(-BLUR_RADIUS, BLUR_RADIUS + 1):
-                sample_idx = second_idx + offset
-                if sample_idx >= 0 and sample_idx < TPB:
-                    blur_sum += rebind[Scalar[dtype]](input_shared[sample_idx])
-                    blur_count += 1
-
-            if blur_count > 0:
-                blur_shared[second_idx] = blur_sum / blur_count
-            else:
-                blur_shared[second_idx] = 0.0
-
-    barrier()  # Wait for Stage 2 completion
-
-    # Stage 3: Final smoothing (all threads)
+    # Each thread computes partial product
+    var partial_product: Scalar[dtype] = 0.0
     if global_i < size:
-        final_value = blur_shared[local_i]
+        # LayoutTensor indexing `[0]` returns the underlying SIMD value
+        partial_product = a[global_i][0] * b[global_i][0]
 
-        # Neighbor smoothing with 0.6 scaling
-        if local_i > 0:
-            final_value = (final_value + blur_shared[local_i - 1]) * 0.6
-        if local_i < TPB - 1:
-            final_value = (final_value + blur_shared[local_i + 1]) * 0.6
+    # The magic: block.sum() replaces 15+ lines of manual reduction!
+    # Just like warp.sum() but for the entire block
+    total = block.sum[block_size=tpb, broadcast=False](
+        val=SIMD[DType.float32, 1](partial_product)
+    )
 
-        output[global_i] = final_value
-
-    barrier()  # Ensure all writes complete
-
-
-# ANCHOR_END: multi_stage_pipeline_solution
+    # Only thread 0 writes the result
+    if local_i == 0:
+        output[0] = total[0]
 
 
-# Double-buffered stencil configuration
-alias STENCIL_ITERATIONS = 3
-alias BUFFER_COUNT = 2
+# ANCHOR_END: block_sum_dot_product_solution
 
 
-# ANCHOR: double_buffered_stencil_solution
-fn double_buffered_stencil_computation[
-    layout: Layout
+# ANCHOR: traditional_dot_product_solution
+fn traditional_dot_product[
+    in_layout: Layout, out_layout: Layout, tpb: Int
 ](
-    output: LayoutTensor[mut=True, dtype, layout],
-    input: LayoutTensor[mut=False, dtype, layout],
+    output: LayoutTensor[mut=True, dtype, out_layout],
+    a: LayoutTensor[mut=False, dtype, in_layout],
+    b: LayoutTensor[mut=False, dtype, in_layout],
     size: Int,
 ):
-    """Double-buffered stencil computation with memory barrier coordination.
+    """Traditional dot product using shared memory + barriers + tree reduction.
+    Educational but complex - shows the manual coordination needed."""
 
-    Iteratively applies 3-point stencil using alternating buffers.
-    Uses mbarrier APIs for precise buffer swap coordination.
+    shared = tb[dtype]().row_major[tpb]().shared().alloc()
+    global_i = block_dim.x * block_idx.x + thread_idx.x
+    local_i = thread_idx.x
+
+    # Each thread computes partial product
+    if global_i < size:
+        a_val = rebind[Scalar[dtype]](a[global_i])
+        b_val = rebind[Scalar[dtype]](b[global_i])
+        shared[local_i] = a_val * b_val
+
+    barrier()
+
+    # Tree reduction in shared memory - complex but educational
+    var stride = tpb // 2
+    while stride > 0:
+        if local_i < stride:
+            shared[local_i] += shared[local_i + stride]
+        barrier()
+        stride //= 2
+
+    # Only thread 0 writes final result
+    if local_i == 0:
+        output[0] = shared[0]
+
+
+# ANCHOR_END: traditional_dot_product_solution
+
+alias bin_layout = Layout.row_major(SIZE)  # Max SIZE elements per bin
+
+
+# ANCHOR: block_histogram_solution
+fn block_histogram_bin_extract[
+    in_layout: Layout, bin_layout: Layout, out_layout: Layout, tpb: Int
+](
+    input_data: LayoutTensor[mut=False, dtype, in_layout],
+    bin_output: LayoutTensor[mut=True, dtype, bin_layout],
+    count_output: LayoutTensor[mut=True, DType.int32, out_layout],
+    size: Int,
+    target_bin: Int,
+    num_bins: Int,
+):
+    """Parallel histogram using block.prefix_sum() for bin extraction.
+
+    This demonstrates advanced parallel filtering and extraction:
+    1. Each thread determines which bin its element belongs to
+    2. Use block.prefix_sum() to compute write positions for target_bin elements
+    3. Extract and pack only elements belonging to target_bin
     """
-
-    # Double-buffering: Two shared memory buffers
-    buffer_A = tb[dtype]().row_major[TPB]().shared().alloc()
-    buffer_B = tb[dtype]().row_major[TPB]().shared().alloc()
-
-    # Memory barriers for coordinating buffer swaps
-    init_barrier = tb[DType.uint64]().row_major[1]().shared().alloc()
-    iter_barrier = tb[DType.uint64]().row_major[1]().shared().alloc()
-    final_barrier = tb[DType.uint64]().row_major[1]().shared().alloc()
 
     global_i = block_dim.x * block_idx.x + thread_idx.x
     local_i = thread_idx.x
 
-    # Initialize barriers (only thread 0)
+    # Step 1: Each thread determines its bin and element value
+    var my_value: Scalar[dtype] = 0.0
+    var my_bin: Int = -1
+
+    if global_i < size:
+        # `[0]` returns the underlying SIMD value
+        my_value = input_data[global_i][0]
+        # Bin values [0.0, 1.0) into num_bins buckets
+        my_bin = Int(floor(my_value * num_bins))
+        # Clamp to valid range
+        if my_bin >= num_bins:
+            my_bin = num_bins - 1
+        if my_bin < 0:
+            my_bin = 0
+
+    # Step 2: Create predicate for target bin extraction
+    var belongs_to_target: Int = 0
+    if global_i < size and my_bin == target_bin:
+        belongs_to_target = 1
+
+    # Step 3: Use block.prefix_sum() for parallel bin extraction!
+    # This computes where each thread should write within the target bin
+    write_offset = block.prefix_sum[
+        dtype = DType.int32, block_size=tpb, exclusive=True
+    ](val=SIMD[DType.int32, 1](belongs_to_target))
+
+    # Step 4: Extract and pack elements belonging to target_bin
+    if belongs_to_target == 1:
+        bin_output[Int(write_offset[0])] = my_value
+
+    # Step 5: Final thread computes total count for this bin
+    if local_i == tpb - 1:
+        # Inclusive sum = exclusive sum + my contribution
+        total_count = write_offset[0] + belongs_to_target
+        count_output[0] = total_count
+
+
+# ANCHOR_END: block_histogram_solution
+
+alias vector_layout = Layout.row_major(SIZE)  # For full vector output
+
+
+# ANCHOR: block_normalize_solution
+fn block_normalize_vector[
+    in_layout: Layout, out_layout: Layout, tpb: Int
+](
+    input_data: LayoutTensor[mut=False, dtype, in_layout],
+    output_data: LayoutTensor[mut=True, dtype, out_layout],
+    size: Int,
+):
+    """Vector mean normalization using block.sum() + block.broadcast() combination.
+
+    This demonstrates the complete block operations workflow:
+    1. Use block.sum() to compute sum of all elements (all → one)
+    2. Thread 0 computes mean = sum / size
+    3. Use block.broadcast() to share mean to all threads (one → all)
+    4. Each thread normalizes: output[i] = input[i] / mean
+    """
+
+    global_i = block_dim.x * block_idx.x + thread_idx.x
+    local_i = thread_idx.x
+
+    # Step 1: Each thread loads its element
+    var my_value: Scalar[dtype] = 0.0
+    if global_i < size:
+        my_value = input_data[global_i][0]  # Extract SIMD value
+
+    # Step 2: Use block.sum() to compute total sum (familiar from earlier!)
+    total_sum = block.sum[block_size=tpb, broadcast=False](
+        val=SIMD[DType.float32, 1](my_value)
+    )
+
+    # Step 3: Thread 0 computes mean value
+    var mean_value: Scalar[dtype] = 1.0  # Default to avoid division by zero
     if local_i == 0:
-        mbarrier_init(init_barrier.ptr, TPB)
-        mbarrier_init(iter_barrier.ptr, TPB)
-        mbarrier_init(final_barrier.ptr, TPB)
+        if total_sum[0] > 0.0:
+            mean_value = total_sum[0] / Float32(size)
 
-    # Initialize buffer_A with input data
-    if local_i < TPB and global_i < size:
-        buffer_A[local_i] = input[global_i]
-    else:
-        buffer_A[local_i] = 0.0
+    # Step 4: block.broadcast() shares mean to ALL threads!
+    # This completes the block operations trilogy demonstration
+    broadcasted_mean = block.broadcast[
+        dtype = DType.float32, width=1, block_size=tpb
+    ](val=SIMD[DType.float32, 1](mean_value), src_thread=UInt(0))
 
-    # Wait for buffer_A initialization
-    _ = mbarrier_arrive(init_barrier.ptr)
-    _ = mbarrier_test_wait(init_barrier.ptr, TPB)
-
-    # Iterative stencil processing with double-buffering
-    @parameter
-    for iteration in range(STENCIL_ITERATIONS):
-
-        @parameter
-        if iteration % 2 == 0:
-            # Even iteration: Read from A, Write to B
-            if local_i < TPB:
-                var stencil_sum: Scalar[dtype] = 0.0
-                var stencil_count: Int = 0
-
-                # 3-point stencil: [i-1, i, i+1]
-                for offset in range(-1, 2):
-                    sample_idx = local_i + offset
-                    if sample_idx >= 0 and sample_idx < TPB:
-                        stencil_sum += rebind[Scalar[dtype]](
-                            buffer_A[sample_idx]
-                        )
-                        stencil_count += 1
-
-                if stencil_count > 0:
-                    buffer_B[local_i] = stencil_sum / stencil_count
-                else:
-                    buffer_B[local_i] = buffer_A[local_i]
-
-        else:
-            # Odd iteration: Read from B, Write to A
-            if local_i < TPB:
-                var stencil_sum: Scalar[dtype] = 0.0
-                var stencil_count: Int = 0
-
-                # 3-point stencil: [i-1, i, i+1]
-                for offset in range(-1, 2):
-                    sample_idx = local_i + offset
-                    if sample_idx >= 0 and sample_idx < TPB:
-                        stencil_sum += rebind[Scalar[dtype]](
-                            buffer_B[sample_idx]
-                        )
-                        stencil_count += 1
-
-                if stencil_count > 0:
-                    buffer_A[local_i] = stencil_sum / stencil_count
-                else:
-                    buffer_A[local_i] = buffer_B[local_i]
-
-        # Memory barrier: wait for all writes before buffer swap
-        _ = mbarrier_arrive(iter_barrier.ptr)
-        _ = mbarrier_test_wait(iter_barrier.ptr, TPB)
-
-        # Reinitialize barrier for next iteration
-        if local_i == 0:
-            mbarrier_init(iter_barrier.ptr, TPB)
-
-    # Write final results from active buffer
-    if local_i < TPB and global_i < size:
-
-        @parameter
-        if STENCIL_ITERATIONS % 2 == 0:
-            # Even iterations end in buffer_A
-            output[global_i] = buffer_A[local_i]
-        else:
-            # Odd iterations end in buffer_B
-            output[global_i] = buffer_B[local_i]
-
-    # Final barrier
-    _ = mbarrier_arrive(final_barrier.ptr)
-    _ = mbarrier_test_wait(final_barrier.ptr, TPB)
+    # Step 5: Each thread normalizes by the mean
+    if global_i < size:
+        normalized_value = my_value / broadcasted_mean[0]
+        output_data[global_i] = normalized_value
 
 
-# ANCHOR_END: double_buffered_stencil_solution
-
-
-def test_multi_stage_pipeline():
-    """Test Puzzle 26A: Multi-Stage Pipeline Coordination."""
-    with DeviceContext() as ctx:
-        out = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-        inp = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-
-        # Initialize input with a simple pattern
-        with inp.map_to_host() as inp_host:
-            for i in range(SIZE):
-                # Create a simple wave pattern for blurring
-                inp_host[i] = Float32(i % 10) + Float32(i / 100.0)
-
-        # Create LayoutTensors
-        out_tensor = LayoutTensor[mut=True, dtype, layout](out.unsafe_ptr())
-        inp_tensor = LayoutTensor[mut=False, dtype, layout](inp.unsafe_ptr())
-
-        ctx.enqueue_function[multi_stage_image_blur_pipeline[layout]](
-            out_tensor,
-            inp_tensor,
-            SIZE,
-            grid_dim=BLOCKS_PER_GRID,
-            block_dim=THREADS_PER_BLOCK,
-        )
-
-        ctx.synchronize()
-
-        # Simple verification - check that output differs from input and values are reasonable
-        with out.map_to_host() as out_host, inp.map_to_host() as inp_host:
-            print("Multi-stage pipeline blur completed")
-            print("Input sample:", inp_host[0], inp_host[1], inp_host[2])
-            print("Output sample:", out_host[0], out_host[1], out_host[2])
-
-            # Basic verification - output should be different from input (pipeline processed them)
-            assert_true(
-                abs(out_host[0] - inp_host[0]) > 0.001,
-                "Pipeline should modify values",
-            )
-            assert_true(
-                abs(out_host[1] - inp_host[1]) > 0.001,
-                "Pipeline should modify values",
-            )
-            assert_true(
-                abs(out_host[2] - inp_host[2]) > 0.001,
-                "Pipeline should modify values",
-            )
-
-            # Values should be reasonable (not NaN, not extreme)
-            for i in range(10):
-                assert_true(
-                    out_host[i] >= 0.0, "Output values should be non-negative"
-                )
-                assert_true(
-                    out_host[i] < 1000.0, "Output values should be reasonable"
-                )
-
-            print("✅ Multi-stage pipeline coordination test PASSED!")
-
-
-def test_double_buffered_stencil():
-    """Test Puzzle 26B: Double-Buffered Stencil Computation."""
-    with DeviceContext() as ctx:
-        # Test Puzzle 26B: Double-Buffered Stencil Computation
-        out = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-        inp = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
-
-        # Initialize input with a different pattern for stencil testing
-        with inp.map_to_host() as inp_host:
-            for i in range(SIZE):
-                # Create a step pattern that will be smoothed by stencil
-                inp_host[i] = Float32(1.0 if i % 20 < 10 else 0.0)
-
-        # Create LayoutTensors for Puzzle 26B
-        out_tensor = LayoutTensor[mut=True, dtype, layout](out.unsafe_ptr())
-        inp_tensor = LayoutTensor[mut=False, dtype, layout](inp.unsafe_ptr())
-
-        ctx.enqueue_function[double_buffered_stencil_computation[layout]](
-            out_tensor,
-            inp_tensor,
-            SIZE,
-            grid_dim=BLOCKS_PER_GRID,
-            block_dim=THREADS_PER_BLOCK,
-        )
-
-        ctx.synchronize()
-
-        # Simple verification - check that GPU implementation works correctly
-        with inp.map_to_host() as inp_host, out.map_to_host() as out_host:
-            print("Double-buffered stencil completed")
-            print("Input sample:", inp_host[0], inp_host[1], inp_host[2])
-            print("GPU output sample:", out_host[0], out_host[1], out_host[2])
-
-            # Basic sanity checks
-            var processing_occurred = False
-            var all_values_valid = True
-
-            for i in range(SIZE):
-                # Check if processing occurred (output should differ from step pattern)
-                if abs(out_host[i] - inp_host[i]) > 0.001:
-                    processing_occurred = True
-
-                # Check for invalid values (NaN, infinity, or out of reasonable range)
-                if out_host[i] < 0.0 or out_host[i] > 1.0:
-                    all_values_valid = False
-                    break
-
-            # Verify the stencil smoothed the step pattern
-            assert_true(
-                processing_occurred, "Stencil should modify the input values"
-            )
-            assert_true(
-                all_values_valid,
-                "All output values should be in valid range [0,1]",
-            )
-
-            # Check that values are smoothed (no sharp transitions)
-            var smooth_transitions = True
-            for i in range(1, SIZE - 1):
-                # Check if transitions are reasonably smooth (not perfect step function)
-                var left_diff = abs(out_host[i] - out_host[i - 1])
-                var right_diff = abs(out_host[i + 1] - out_host[i])
-                # After 3 stencil iterations, sharp 0->1 transitions should be smoothed
-                if left_diff > 0.8 or right_diff > 0.8:
-                    smooth_transitions = False
-                    break
-
-            assert_true(
-                smooth_transitions, "Stencil should smooth sharp transitions"
-            )
-
-            print("✅ Double-buffered stencil test PASSED!")
+# ANCHOR_END: block_normalize_solution
 
 
 def main():
-    """Run GPU synchronization tests based on command line arguments."""
-    print("Puzzle 26: GPU Synchronization Primitives")
-    print("=" * 50)
-
-    # Parse command line arguments
     if len(argv()) != 2:
-        print("Usage: p26.mojo [--multi-stage | --double-buffer]")
-        print("  --multi-stage: Test multi-stage pipeline coordination")
-        print("  --double-buffer: Test double-buffered stencil computation")
+        print(
+            "Usage: --traditional-dot-product | --block-sum-dot-product |"
+            " --histogram | --normalize"
+        )
         return
 
-    if argv()[1] == "--multi-stage":
-        print("TPB:", TPB)
-        print("SIZE:", SIZE)
-        print("STAGE1_THREADS:", STAGE1_THREADS)
-        print("STAGE2_THREADS:", STAGE2_THREADS)
-        print("BLUR_RADIUS:", BLUR_RADIUS)
-        print("")
-        print("Testing Puzzle 26A: Multi-Stage Pipeline Coordination")
-        print("=" * 60)
-        test_multi_stage_pipeline()
-    elif argv()[1] == "--double-buffer":
-        print("TPB:", TPB)
-        print("SIZE:", SIZE)
-        print("STENCIL_ITERATIONS:", STENCIL_ITERATIONS)
-        print("BUFFER_COUNT:", BUFFER_COUNT)
-        print("")
-        print("Testing Puzzle 26B: Double-Buffered Stencil Computation")
-        print("=" * 60)
-        test_double_buffered_stencil()
-    else:
-        print("Usage: p26.mojo [--multi-stage | --double-buffer]")
+    with DeviceContext() as ctx:
+        if argv()[1] == "--traditional-dot-product":
+            out = ctx.enqueue_create_buffer[dtype](1).enqueue_fill(0)
+            a = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
+            b_buf = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
+
+            var expected: Scalar[dtype] = 0.0
+            with a.map_to_host() as a_host, b_buf.map_to_host() as b_host:
+                for i in range(SIZE):
+                    a_host[i] = i
+                    b_host[i] = 2 * i
+                    expected += a_host[i] * b_host[i]
+
+            print("SIZE:", SIZE)
+            print("TPB:", TPB)
+            print("Expected result:", expected)
+
+            a_tensor = LayoutTensor[mut=False, dtype, in_layout](a.unsafe_ptr())
+            b_tensor = LayoutTensor[mut=False, dtype, in_layout](
+                b_buf.unsafe_ptr()
+            )
+            out_tensor = LayoutTensor[mut=True, dtype, out_layout](
+                out.unsafe_ptr()
+            )
+
+            # Traditional approach: works perfectly when size == TPB
+            ctx.enqueue_function[
+                traditional_dot_product[in_layout, out_layout, TPB]
+            ](
+                out_tensor,
+                a_tensor,
+                b_tensor,
+                SIZE,
+                grid_dim=(1, 1),  # ✅ Single block works when size == TPB
+                block_dim=(TPB, 1),
+            )
+
+            ctx.synchronize()
+
+            with out.map_to_host() as result_host:
+                result = result_host[0]
+                print("Traditional result:", result)
+                assert_equal(result, expected)
+                print("Complex: shared memory + barriers + tree reduction")
+
+        elif argv()[1] == "--block-sum-dot-product":
+            out = ctx.enqueue_create_buffer[dtype](1).enqueue_fill(0)
+            a = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
+            b_buf = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
+
+            var expected: Scalar[dtype] = 0.0
+            with a.map_to_host() as a_host, b_buf.map_to_host() as b_host:
+                for i in range(SIZE):
+                    a_host[i] = i
+                    b_host[i] = 2 * i
+                    expected += a_host[i] * b_host[i]
+
+            print("SIZE:", SIZE)
+            print("TPB:", TPB)
+            print("Expected result:", expected)
+
+            a_tensor = LayoutTensor[mut=False, dtype, in_layout](a.unsafe_ptr())
+            b_tensor = LayoutTensor[mut=False, dtype, in_layout](
+                b_buf.unsafe_ptr()
+            )
+            out_tensor = LayoutTensor[mut=True, dtype, out_layout](
+                out.unsafe_ptr()
+            )
+
+            # Block.sum(): Same result with dramatically simpler code!
+            ctx.enqueue_function[
+                block_sum_dot_product[in_layout, out_layout, TPB]
+            ](
+                out_tensor,
+                a_tensor,
+                b_tensor,
+                SIZE,
+                grid_dim=(1, 1),  # Same single block as traditional
+                block_dim=(TPB, 1),
+            )
+
+            ctx.synchronize()
+
+            with out.map_to_host() as result_host:
+                result = result_host[0]
+                print("Block.sum result:", result)
+                assert_equal(result, expected)
+                print("Block.sum() gives identical results!")
+                print(
+                    "Compare the code: 15+ lines of barriers → 1 line of"
+                    " block.sum()!"
+                )
+                print("Just like warp.sum() but for the entire block")
+
+        elif argv()[1] == "--histogram":
+            print("SIZE:", SIZE)
+            print("TPB:", TPB)
+            print("NUM_BINS:", NUM_BINS)
+            print()
+
+            # Create input data with known distribution across bins
+            input_buf = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
+
+            # Create test data: values distributed across 8 bins [0.0, 1.0)
+            with input_buf.map_to_host() as input_host:
+                for i in range(SIZE):
+                    # Create values: 0.1, 0.2, 0.3, ..., cycling through bins
+                    input_host[i] = (
+                        Float32(i % 80) / 100.0
+                    )  # Values [0.0, 0.79]
+
+            print("Input sample:", end=" ")
+            with input_buf.map_to_host() as input_host:
+                for i in range(min(16, SIZE)):
+                    print(input_host[i], end=" ")
+            print("...")
+            print()
+
+            input_tensor = LayoutTensor[mut=False, dtype, in_layout](
+                input_buf.unsafe_ptr()
+            )
+
+            # Demonstrate histogram for each bin using block.prefix_sum()
+            for target_bin in range(NUM_BINS):
+                print(
+                    "=== Processing Bin",
+                    target_bin,
+                    "(range [",
+                    Float32(target_bin) / NUM_BINS,
+                    ",",
+                    Float32(target_bin + 1) / NUM_BINS,
+                    ")) ===",
+                )
+
+                # Create output buffers for this bin
+                bin_data = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(
+                    0
+                )
+                bin_count = ctx.enqueue_create_buffer[DType.int32](
+                    1
+                ).enqueue_fill(0)
+
+                bin_tensor = LayoutTensor[mut=True, dtype, bin_layout](
+                    bin_data.unsafe_ptr()
+                )
+                count_tensor = LayoutTensor[mut=True, DType.int32, out_layout](
+                    bin_count.unsafe_ptr()
+                )
+
+                # Execute histogram kernel for this specific bin
+                ctx.enqueue_function[
+                    block_histogram_bin_extract[
+                        in_layout, bin_layout, out_layout, TPB
+                    ]
+                ](
+                    input_tensor,
+                    bin_tensor,
+                    count_tensor,
+                    SIZE,
+                    target_bin,
+                    NUM_BINS,
+                    grid_dim=(
+                        1,
+                        1,
+                    ),  # Single block demonstrates block.prefix_sum()
+                    block_dim=(TPB, 1),
+                )
+
+                ctx.synchronize()
+
+                # Display results for this bin
+                with bin_count.map_to_host() as count_host:
+                    count = count_host[0]
+                    print("Bin", target_bin, "count:", count)
+
+                with bin_data.map_to_host() as bin_host:
+                    print("Bin", target_bin, "extracted elements:", end=" ")
+                    for i in range(min(8, Int(count))):
+                        print(bin_host[i], end=" ")
+                    if count > 8:
+                        print("...")
+                    else:
+                        print()
+                print()
+
+        elif argv()[1] == "--normalize":
+            print("SIZE:", SIZE)
+            print("TPB:", TPB)
+            print()
+
+            # Create input data with known values for easy verification
+            input_buf = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
+            output_buf = ctx.enqueue_create_buffer[dtype](SIZE).enqueue_fill(0)
+
+            # Create test data: values like [1, 2, 3, 4, 5, ..., 8, 1, 2, 3, ...]
+            # Mean value will be 4.5, so normalized values will be input[i] / 4.5
+            var sum_value: Scalar[dtype] = 0.0
+            with input_buf.map_to_host() as input_host:
+                for i in range(SIZE):
+                    # Create values cycling 1-8, mean will be 4.5
+                    value = Float32(
+                        (i % 8) + 1
+                    )  # Values 1, 2, 3, 4, 5, 6, 7, 8, 1, 2, ...
+                    input_host[i] = value
+                    sum_value += value
+
+            var mean_value = sum_value / Float32(SIZE)
+
+            print("Input sample:", end=" ")
+            with input_buf.map_to_host() as input_host:
+                for i in range(min(16, SIZE)):
+                    print(input_host[i], end=" ")
+            print("...")
+            print("Sum value:", sum_value)
+            print("Mean value:", mean_value)
+            print()
+
+            input_tensor = LayoutTensor[mut=False, dtype, in_layout](
+                input_buf.unsafe_ptr()
+            )
+            output_tensor = LayoutTensor[mut=True, dtype, vector_layout](
+                output_buf.unsafe_ptr()
+            )
+
+            # Execute vector normalization kernel
+            ctx.enqueue_function[
+                block_normalize_vector[in_layout, vector_layout, TPB]
+            ](
+                input_tensor,
+                output_tensor,
+                SIZE,
+                grid_dim=(1, 1),  # Single block demonstrates block.broadcast()
+                block_dim=(TPB, 1),
+            )
+
+            ctx.synchronize()
+
+            # Verify results
+            print("Mean Normalization Results:")
+            with output_buf.map_to_host() as output_host:
+                print("Normalized sample:", end=" ")
+                for i in range(min(16, SIZE)):
+                    print(output_host[i], end=" ")
+                print("...")
+
+                # Verify that the mean normalization worked (mean of output should be ~1.0)
+                var output_sum: Scalar[dtype] = 0.0
+                for i in range(SIZE):
+                    output_sum += output_host[i]
+
+                var output_mean = output_sum / Float32(SIZE)
+                print("Output sum:", output_sum)
+                print("Output mean:", output_mean)
+                print(
+                    "✅ Success: Output mean is",
+                    output_mean,
+                    "(should be close to 1.0)",
+                )
+        else:
+            print(
+                "Available options: [--traditional-dot-product |"
+                " --block-sum-dot-product | --histogram | --normalize]"
+            )
