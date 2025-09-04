@@ -2,8 +2,9 @@ from gpu import thread_idx, block_idx, block_dim, barrier
 from gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 from layout.tensor_builder import LayoutTensorBuild as tb
+from sys import size_of, argv
+from testing import assert_equal
 
-# ANCHOR: conv1d_kernel
 alias TPB = 15
 alias BLOCKS_PER_GRID = (2, 1)
 
@@ -34,6 +35,10 @@ fn conv1d_kernel[
         next_idx = global_i + TPB
         if next_idx < input_size:
             shared_a[TPB + local_i] = input[next_idx]
+        else:
+            # Initialize out-of-bounds elements to 0 to avoid reading from uninitialized memory
+            # which is an undefined behavior
+            shared_a[TPB + local_i] = 0
 
     if local_i < conv_size:
         shared_b[local_i] = kernel[local_i]
@@ -51,10 +56,6 @@ fn conv1d_kernel[
         output[global_i] = local_sum
 
 
-# ANCHOR_END: conv1d_kernel
-
-
-# ANCHOR: conv1d_custom_op
 import compiler
 from runtime.asyncrt import DeviceContextPtr
 from tensor import InputTensor, OutputTensor
@@ -100,14 +101,21 @@ struct Conv1DCustomOp:
                 ),
                 0,
             )
-
-            # FILL ME IN with 1 line calling our conv1d_kernel
-
+            # ANCHOR: conv1d_custom_op_solution
+            gpu_ctx.enqueue_function[
+                conv1d_kernel[
+                    in_layout, out_layout, conv_layout, input_size, conv_size
+                ]
+            ](
+                output_tensor,
+                input_tensor,
+                kernel_tensor,
+                grid_dim=BLOCKS_PER_GRID,
+                block_dim=(TPB, 1),
+            )
+            # ANCHOR_END: conv1d_custom_op_solution
         elif target == "cpu":
             # we can fallback to CPU
             pass
         else:
             raise Error("Unsupported target: " + target)
-
-
-# ANCHOR_END: conv1d_custom_op

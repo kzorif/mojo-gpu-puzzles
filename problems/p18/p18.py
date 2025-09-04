@@ -1,5 +1,5 @@
-# ANCHOR: softmax_custom_op_graph
 from pathlib import Path
+
 import numpy as np
 from max.driver import CPU, Accelerator, Device, Tensor, accelerator_count
 from max.dtype import DType
@@ -17,7 +17,7 @@ def softmax(
     dtype = DType.float32
     input_tensor = Tensor.from_numpy(input).to(device)
     mojo_kernels = Path(__file__).parent / "op"
-
+    # ANCHOR: softmax_custom_op_graph_solution
     with Graph(
         "softmax_graph",
         input_types=[
@@ -29,10 +29,30 @@ def softmax(
         ],
         custom_extensions=[mojo_kernels],
     ) as graph:
-        # FILL IN (roughly 4 unformatted lines)
-        pass
+        input_value = graph.inputs[0]
 
-    # ANCHOR_END: softmax_custom_op_graph
+        # The output shape is the same as the input for softmax
+        # Note: the name must match the name used in `@compiler.register("softmax")` in op/softmax.mojo
+        output = ops.custom(
+            name="softmax",
+            values=[input_value],
+            device=DeviceRef.from_device(device),
+            out_types=[
+                TensorType(
+                    dtype=input_value.tensor.dtype,
+                    shape=input_value.tensor.shape,
+                    device=DeviceRef.from_device(device),
+                )
+            ],
+            parameters={
+                "target": "gpu" if device == Accelerator() else "cpu",
+                "input_size": input_tensor.shape[0],
+                "dtype": dtype,
+            },
+        )[0].tensor
+        graph.output(output)
+
+    # ANCHOR_END: softmax_custom_op_graph_solution
 
     print(f"Compiling softmax graph on {device}")
     model = session.load(graph)

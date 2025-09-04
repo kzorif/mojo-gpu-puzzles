@@ -35,7 +35,7 @@ fn matmul_idiomatic_tiled[
     tiled_col = block_idx.x * TPB + local_col
 
     # Get the tile of the output matrix that this thread block is responsible for
-    out_tile = output.tile[TPB, TPB](block_idx.y, block_idx.x)
+    output_tile = output.tile[TPB, TPB](block_idx.y, block_idx.x)
     a_shared = tb[dtype]().row_major[TPB, TPB]().shared().alloc().fill(0)
     b_shared = tb[dtype]().row_major[TPB, TPB]().shared().alloc().fill(0)
 
@@ -66,10 +66,10 @@ fn matmul_idiomatic_tiled[
 
     # Write final result with bounds checking (needed for attention's variable sizes)
     if tiled_row < rows and tiled_col < cols:
-        out_tile[local_row, local_col] = acc
+        output_tile[local_row, local_col] = acc
 
 
-# ANCHOR: transpose_kernel
+# ANCHOR: transpose_kernel_solution
 fn transpose_kernel[
     layout_in: Layout,  # Layout for input matrix (seq_len, d)
     layout_out: Layout,  # Layout for output matrix (d, seq_len)
@@ -80,69 +80,95 @@ fn transpose_kernel[
     output: LayoutTensor[mut=True, dtype, layout_out, MutableAnyOrigin],
     inp: LayoutTensor[mut=False, dtype, layout_in, MutableAnyOrigin],
 ):
-    # FILL ME IN (roughly 18 lines)
-    ...
+    """Transpose matrix using shared memory tiling for coalesced access."""
+    shared_tile = tb[dtype]().row_major[TPB, TPB]().shared().alloc()
+
+    local_row = thread_idx.y
+    local_col = thread_idx.x
+
+    global_row = block_idx.y * TPB + local_row
+    global_col = block_idx.x * TPB + local_col
+
+    if global_row < rows and global_col < cols:
+        shared_tile[local_row, local_col] = inp[global_row, global_col]
+    else:
+        shared_tile[local_row, local_col] = 0.0
+
+    barrier()
+
+    out_row = block_idx.x * TPB + local_row
+    out_col = block_idx.y * TPB + local_col
+
+    # Store data from shared memory to global memory (coalesced write)
+    # Note: we transpose the shared memory access pattern
+    if out_row < cols and out_col < rows:
+        output[out_row, out_col] = shared_tile[local_col, local_row]
 
 
-# ANCHOR_END: transpose_kernel
+# ANCHOR_END: transpose_kernel_solution
 
 
 # Apply softmax to attention scores taken from p16
 fn softmax_gpu_kernel[
     layout: Layout,
-    seq_len: Int,
+    input_size: Int,
     dtype: DType = DType.float32,
 ](
-    output: LayoutTensor[mut=True, dtype, layout, MutableAnyOrigin],
-    scores: LayoutTensor[mut=False, dtype, layout, MutableAnyOrigin],
+    output: LayoutTensor[mut=True, dtype, layout],
+    input: LayoutTensor[mut=False, dtype, layout],
 ):
-    """Apply softmax to attention scores - exact p16 pattern."""
     shared_max = tb[dtype]().row_major[TPB]().shared().alloc()
     shared_sum = tb[dtype]().row_major[TPB]().shared().alloc()
     global_i = block_dim.x * block_idx.x + thread_idx.x
     local_i = thread_idx.x
 
     var thread_max: Scalar[dtype] = min_finite[dtype]()
-    if global_i < seq_len:
-        thread_max = rebind[Scalar[dtype]](scores[global_i])
+    if global_i < input_size:
+        thread_max = rebind[Scalar[dtype]](input[global_i])
 
     shared_max[local_i] = thread_max
     barrier()
 
-    # Parallel reduction to find max
+    # Parallel reduction to find max similar to reduction we saw before
+    # Note we need to avoid race conditions by reading the value first and then writing
     stride = TPB // 2
     while stride > 0:
+        var temp_max: Scalar[dtype] = min_finite[dtype]()
         if local_i < stride:
-            shared_max[local_i] = max(
-                shared_max[local_i], shared_max[local_i + stride]
-            )
+            temp_max = rebind[Scalar[dtype]](shared_max[local_i + stride])
+        barrier()
+        if local_i < stride:
+            shared_max[local_i] = max(shared_max[local_i], temp_max)
         barrier()
         stride = stride // 2
 
     block_max = shared_max[0]
 
     var exp_val: Scalar[dtype] = 0.0
-    if global_i < seq_len:
-        exp_val = rebind[Scalar[dtype]](exp(scores[global_i] - block_max))
+    if global_i < input_size:
+        exp_val = rebind[Scalar[dtype]](exp(input[global_i] - block_max))
         output[global_i] = exp_val
 
     shared_sum[local_i] = exp_val
     barrier()
 
-    # Parallel reduction for sum
+    # Parallel reduction for sum similar to reduction we saw before
+    # Note we need to avoid race conditions by reading the value first and then writing
     stride = TPB // 2
     while stride > 0:
+        var temp_sum: Scalar[dtype] = 0.0
         if local_i < stride:
-            shared_sum[local_i] = (
-                shared_sum[local_i] + shared_sum[local_i + stride]
-            )
+            temp_sum = rebind[Scalar[dtype]](shared_sum[local_i + stride])
+        barrier()
+        if local_i < stride:
+            shared_sum[local_i] += temp_sum
         barrier()
         stride = stride // 2
 
     block_sum = shared_sum[0]
 
     # Normalize by sum
-    if global_i < seq_len:
+    if global_i < input_size:
         output[global_i] = output[global_i] / block_sum
 
 
@@ -168,7 +194,7 @@ fn attention_cpu_kernel[
         scores.append(0.0)
         weights.append(0.0)
 
-    # CPU: Compute attention scores K[i] · Q directly for each row i of K
+    # Compute attention scores: Q · K[i] for each row i of K
     for i in range(seq_len):
         var score: Float32 = 0.0
         for dim in range(d):
@@ -235,7 +261,6 @@ struct AttentionCustomOp:
 
         @parameter
         if target == "gpu":
-            # ANCHOR: attention_orchestration
             var gpu_ctx = rebind[DeviceContext](ctx[])
 
             # Define layouts for matrix multiplication
@@ -276,31 +301,67 @@ struct AttentionCustomOp:
                 k_t_buf.unsafe_ptr()
             )
 
+            # ANCHOR: attention_orchestration_solution
+
             # Step 1: Reshape Q from (d,) to (1, d) - no buffer needed
-            # FILL ME IN 1 line
+            q_2d = q_tensor.reshape[layout_q_2d]()
 
             # Step 2: Transpose K from (seq_len, d) to K^T (d, seq_len)
-            # FILL ME IN 1 function call
+            gpu_ctx.enqueue_function[
+                transpose_kernel[layout_k, layout_k_t, seq_len, d, dtype]
+            ](
+                k_t,
+                k_tensor,
+                grid_dim=transpose_blocks_per_grid,
+                block_dim=matmul_threads_per_block,
+            )
 
             # Step 3: Compute attention scores using matmul: Q @ K^T = (1, d) @ (d, seq_len) -> (1, seq_len)
-            # GPU: Uses matrix multiplication to compute all Q · K[i] scores in parallel
+            # This computes Q · K^T[i] = Q · K[i] for each column i of K^T (which is row i of K)
             # Reuse scores_weights_buf as (1, seq_len) for scores
-            # FILL ME IN 2 lines
+            scores_2d = LayoutTensor[
+                mut=True, dtype, layout_scores_2d, MutableAnyOrigin
+            ](scores_weights_buf.unsafe_ptr())
+            gpu_ctx.enqueue_function[
+                matmul_idiomatic_tiled[layout_q_2d, 1, seq_len, d, dtype]
+            ](
+                scores_2d,
+                q_2d,
+                k_t,
+                grid_dim=scores_blocks_per_grid,
+                block_dim=matmul_threads_per_block,
+            )
 
             # Step 4: Reshape scores from (1, seq_len) to (seq_len,) for softmax
-            # FILL ME IN 1 line
+            weights = scores_2d.reshape[layout_scores]()
 
             # Step 5: Apply softmax to get attention weights
-            # FILL ME IN 1 function call
+            gpu_ctx.enqueue_function[
+                softmax_gpu_kernel[layout_scores, seq_len, dtype]
+            ](
+                weights,
+                weights,
+                grid_dim=(1, 1),
+                block_dim=(seq_len, 1),
+            )
 
             # Step 6: Reshape weights from (seq_len,) to (1, seq_len) for final matmul
-            # FILL ME IN 1 line
+            weights_2d = weights.reshape[layout_weights_2d]()
 
             # Step 7: Compute final result using matmul: weights @ V = (1, seq_len) @ (seq_len, d) -> (1, d)
             # Reuse out_tensor reshaped as (1, d) for result
-            # FILL ME IN 2 lines
+            result_2d = output_tensor.reshape[layout_result_2d]()
+            gpu_ctx.enqueue_function[
+                matmul_idiomatic_tiled[layout_weights_2d, 1, d, seq_len, dtype]
+            ](
+                result_2d,
+                weights_2d,
+                v_tensor,
+                grid_dim=result_blocks_per_grid,
+                block_dim=matmul_threads_per_block,
+            )
 
-            # ANCHOR_END: attention_orchestration
+            # ANCHOR_END: attention_orchestration_solution
 
         elif target == "cpu":
             attention_cpu_kernel[

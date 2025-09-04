@@ -5,7 +5,6 @@ from gpu.memory import AddressSpace
 from sys import size_of
 from testing import assert_equal
 
-# ANCHOR: pooling
 alias TPB = 8
 alias SIZE = 8
 alias BLOCKS_PER_GRID = (1, 1)
@@ -13,6 +12,7 @@ alias THREADS_PER_BLOCK = (TPB, 1)
 alias dtype = DType.float32
 
 
+# ANCHOR: pooling_solution
 fn pooling(
     output: UnsafePointer[Scalar[dtype]],
     a: UnsafePointer[Scalar[dtype]],
@@ -25,10 +25,22 @@ fn pooling(
     ]()
     global_i = block_dim.x * block_idx.x + thread_idx.x
     local_i = thread_idx.x
-    # FILL ME IN (roughly 10 lines)
+    if global_i < size:
+        shared[local_i] = a[global_i]
+
+    barrier()
+
+    if global_i == 0:
+        output[0] = shared[0]
+    elif global_i == 1:
+        output[1] = shared[0] + shared[1]
+    elif 1 < global_i < size:
+        output[global_i] = (
+            shared[local_i - 2] + shared[local_i - 1] + shared[local_i]
+        )
 
 
-# ANCHOR_END: pooling
+# ANCHOR_END: pooling_solution
 
 
 def main():

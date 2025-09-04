@@ -10,7 +10,6 @@ alias TPB = 15
 alias BLOCKS_PER_GRID = (2, 1)
 
 
-# ANCHOR: conv1d_kernel
 fn conv1d_kernel[
     in_layout: Layout,
     out_layout: Layout,
@@ -58,8 +57,6 @@ fn conv1d_kernel[
         output[global_i] = local_sum
 
 
-# ANCHOR_END: conv1d_kernel
-
 import compiler
 from runtime.asyncrt import DeviceContextPtr
 from tensor import InputTensor, OutputTensor
@@ -77,9 +74,9 @@ struct Conv1DCustomOp:
         conv_size: Int,
         dtype: DType = DType.float32,
     ](
-        output: OutputTensor[rank=1],
-        input: InputTensor[dtype = output.dtype, rank = output.rank],
-        kernel: InputTensor[dtype = output.dtype, rank = output.rank],
+        output: OutputTensor[dtype=dtype, rank=1],
+        input: InputTensor[dtype=dtype, rank = output.rank],
+        kernel: InputTensor[dtype=dtype, rank = output.rank],
         # the context is needed for some GPU calls
         ctx: DeviceContextPtr,
     ) raises:
@@ -103,6 +100,7 @@ struct Conv1DCustomOp:
                 ),
                 0,
             )
+            # ANCHOR: conv1d_custom_op_solution
             gpu_ctx.enqueue_function[
                 conv1d_kernel[
                     in_layout, out_layout, conv_layout, input_size, conv_size
@@ -114,6 +112,7 @@ struct Conv1DCustomOp:
                 grid_dim=BLOCKS_PER_GRID,
                 block_dim=(TPB, 1),
             )
+            # ANCHOR_END: conv1d_custom_op_solution
         elif target == "cpu":
             # we can fallback to CPU
             pass

@@ -4,8 +4,9 @@ from layout import Layout, LayoutTensor
 from layout.tensor_builder import LayoutTensorBuild as tb
 from testing import assert_equal
 from sys import argv
+from os.atomic import Atomic
 
-# ANCHOR: shared_memory_race
+# ANCHOR: shared_memory_race_solution
 
 alias SIZE = 2
 alias BLOCKS_PER_GRID = 1
@@ -19,24 +20,33 @@ fn shared_memory_race(
     a: LayoutTensor[mut=False, dtype, layout],
     size: Int,
 ):
+    """Fixed: sequential access with barriers eliminates race conditions."""
     row = thread_idx.y
     col = thread_idx.x
 
     shared_sum = tb[dtype]().row_major[1]().shared().alloc()
 
-    if row < size and col < size:
-        shared_sum[0] += a[row, col]
+    # Only thread 0 does all the accumulation work to prevent races
+    if row == 0 and col == 0:
+        # Use local accumulation first, then single write to shared memory
+        local_sum = Scalar[dtype](0.0)
+        for r in range(size):
+            for c in range(size):
+                local_sum += rebind[Scalar[dtype]](a[r, c])
 
-    barrier()
+        shared_sum[0] = local_sum  # Single write operation
 
+    barrier()  # Ensure thread 0 completes before others read
+
+    # All threads read the safely accumulated result after synchronization
     if row < size and col < size:
         output[row, col] = shared_sum[0]
 
 
-# ANCHOR_END: shared_memory_race
+# ANCHOR_END: shared_memory_race_solution
 
 
-# ANCHOR: add_10_2d_no_guard
+# ANCHOR: add_10_2d_solution
 fn add_10_2d(
     output: LayoutTensor[mut=True, dtype, layout],
     a: LayoutTensor[mut=True, dtype, layout],
@@ -44,10 +54,11 @@ fn add_10_2d(
 ):
     row = thread_idx.y
     col = thread_idx.x
-    output[row, col] = a[row, col] + 10.0
+    if row < size and col < size:
+        output[row, col] = a[row, col] + 10.0
 
 
-# ANCHOR_END: add_10_2d_no_guard
+# ANCHOR_END: add_10_2d_solution
 
 
 def main():
@@ -107,6 +118,7 @@ def main():
 
         elif flag == "--race-condition":
             print("Running race condition example...")
+            # Calculate total sum that should appear in all positions
             total_sum = Scalar[dtype](0.0)
             with a.map_to_host() as a_host:
                 for i in range(SIZE * SIZE):

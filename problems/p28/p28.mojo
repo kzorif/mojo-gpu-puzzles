@@ -7,7 +7,7 @@ from layout.layout_tensor import copy_dram_to_sram_async
 from sys import argv, info
 from testing import assert_equal, assert_almost_equal
 
-# ANCHOR: async_copy_overlap_convolution
+
 alias VECTOR_SIZE = 16384
 alias CONV_TILE_SIZE = 256
 alias KERNEL_SIZE = 5
@@ -21,6 +21,7 @@ alias dtype = DType.float32
 alias layout_async = Layout.row_major(VECTOR_SIZE)
 
 
+# ANCHOR: async_copy_overlap_convolution_solution
 fn async_copy_overlap_convolution[
     dtype: DType, layout: Layout
 ](
@@ -38,10 +39,44 @@ fn async_copy_overlap_convolution[
     input_shared = tb[dtype]().row_major[CONV_TILE_SIZE]().shared().alloc()
     kernel_shared = tb[dtype]().row_major[KERNEL_SIZE]().shared().alloc()
 
-    # FILL IN HERE (roughly 19 lines)
+    local_i = thread_idx.x
+
+    # Phase 1: Launch async copy for input tile
+    # Note: tile() does NOT perform bounds checking - ensure valid tile bounds
+    input_tile = input.tile[CONV_TILE_SIZE](block_idx.x)
+
+    # Use async copy with thread layout matching p14 pattern
+    alias load_layout = Layout.row_major(THREADS_PER_BLOCK_ASYNC, 1)
+    copy_dram_to_sram_async[thread_layout=load_layout](input_shared, input_tile)
+
+    # Phase 2: Load kernel synchronously (small data)
+    if local_i < KERNEL_SIZE:
+        kernel_shared[local_i] = kernel[local_i]
+
+    # Phase 3: Wait for async copy to complete
+    async_copy_wait_all()  # Always wait since we always do async copy
+    barrier()  # Sync all threads
+
+    # Phase 4: Compute convolution
+    global_i = block_idx.x * CONV_TILE_SIZE + local_i
+    if local_i < CONV_TILE_SIZE and global_i < output.shape[0]():
+        var result: output.element_type = 0
+
+        # Simple convolution avoiding boundary issues
+        if local_i >= HALO_SIZE and local_i < CONV_TILE_SIZE - HALO_SIZE:
+            # Full convolution for center elements
+            for k in range(KERNEL_SIZE):
+                input_idx = local_i + k - HALO_SIZE
+                if input_idx >= 0 and input_idx < CONV_TILE_SIZE:
+                    result += input_shared[input_idx] * kernel_shared[k]
+        else:
+            # For boundary elements, just copy input (no convolution)
+            result = input_shared[local_i]
+
+        output[global_i] = result
 
 
-# ANCHOR_END: async_copy_overlap_convolution
+# ANCHOR_END: async_copy_overlap_convolution_solution
 
 
 def test_async_copy_overlap_convolution():

@@ -3,7 +3,6 @@ from gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 from testing import assert_equal
 
-# ANCHOR: add_10_blocks_2d_layout_tensor
 alias SIZE = 5
 alias BLOCKS_PER_GRID = (2, 2)
 alias THREADS_PER_BLOCK = (3, 3)
@@ -12,6 +11,7 @@ alias out_layout = Layout.row_major(SIZE, SIZE)
 alias a_layout = Layout.row_major(SIZE, SIZE)
 
 
+# ANCHOR: add_10_blocks_2d_layout_tensor_solution
 fn add_10_blocks_2d[
     out_layout: Layout,
     a_layout: Layout,
@@ -22,10 +22,11 @@ fn add_10_blocks_2d[
 ):
     row = block_dim.y * block_idx.y + thread_idx.y
     col = block_dim.x * block_idx.x + thread_idx.x
-    # FILL ME IN (roughly 2 lines)
+    if row < size and col < size:
+        output[row, col] = a[row, col] + 10.0
 
 
-# ANCHOR_END: add_10_blocks_2d_layout_tensor
+# ANCHOR_END: add_10_blocks_2d_layout_tensor_solution
 
 
 def main():

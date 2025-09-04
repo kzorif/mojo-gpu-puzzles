@@ -3,21 +3,21 @@ from gpu import thread_idx
 from gpu.host import DeviceContext
 from testing import assert_equal
 
-# ANCHOR: add_10
 alias SIZE = 4
 alias BLOCKS_PER_GRID = 1
 alias THREADS_PER_BLOCK = SIZE
 alias dtype = DType.float32
 
 
+# ANCHOR: add_10_solution
 fn add_10(
     output: UnsafePointer[Scalar[dtype]], a: UnsafePointer[Scalar[dtype]]
 ):
     i = thread_idx.x
-    # FILL ME IN (roughly 1 line)
+    output[i] = a[i] + 10.0
 
 
-# ANCHOR_END: add_10
+# ANCHOR_END: add_10_solution
 
 
 def main():

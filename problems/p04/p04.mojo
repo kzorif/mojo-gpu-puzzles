@@ -3,13 +3,13 @@ from gpu import thread_idx, block_dim, block_idx
 from gpu.host import DeviceContext
 from testing import assert_equal
 
-# ANCHOR: add_10_2d
 alias SIZE = 2
 alias BLOCKS_PER_GRID = 1
 alias THREADS_PER_BLOCK = (3, 3)
 alias dtype = DType.float32
 
 
+# ANCHOR: add_10_2d_solution
 fn add_10_2d(
     output: UnsafePointer[Scalar[dtype]],
     a: UnsafePointer[Scalar[dtype]],
@@ -17,10 +17,11 @@ fn add_10_2d(
 ):
     row = thread_idx.y
     col = thread_idx.x
-    # FILL ME IN (roughly 2 lines)
+    if row < size and col < size:
+        output[row * size + col] = a[row * size + col] + 10.0
 
 
-# ANCHOR_END: add_10_2d
+# ANCHOR_END: add_10_2d_solution
 
 
 def main():
@@ -32,10 +33,10 @@ def main():
         a = ctx.enqueue_create_buffer[dtype](SIZE * SIZE).enqueue_fill(0)
         with a.map_to_host() as a_host:
             # row-major
-            for i in range(SIZE):
-                for j in range(SIZE):
-                    a_host[i * SIZE + j] = i * SIZE + j
-                    expected[i * SIZE + j] = a_host[i * SIZE + j] + 10
+            for y in range(SIZE):
+                for x in range(SIZE):
+                    a_host[y * SIZE + x] = y * SIZE + x
+                    expected[y * SIZE + x] = a_host[y * SIZE + x] + 10
 
         ctx.enqueue_function[add_10_2d](
             out.unsafe_ptr(),
@@ -50,6 +51,6 @@ def main():
         with out.map_to_host() as out_host:
             print("out:", out_host)
             print("expected:", expected)
-            for i in range(SIZE):
-                for j in range(SIZE):
-                    assert_equal(out_host[i * SIZE + j], expected[i * SIZE + j])
+            for y in range(SIZE):
+                for x in range(SIZE):
+                    assert_equal(out_host[y * SIZE + x], expected[y * SIZE + x])

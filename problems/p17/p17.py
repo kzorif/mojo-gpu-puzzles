@@ -47,8 +47,8 @@ def conv_1d(
         # Note: the name must match the name used in `@compiler.register("conv1d")` in op/conv1d.mojo
         output = ops.custom(
             name="conv1d",
-            device=DeviceRef.from_device(device),
             values=[input_value, kernel_value],
+            device=DeviceRef.from_device(device),
             out_types=[
                 TensorType(
                     dtype=input_value.tensor.dtype,

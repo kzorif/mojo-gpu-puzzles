@@ -4,7 +4,6 @@ from layout import Layout, LayoutTensor
 from layout.tensor_builder import LayoutTensorBuild as tb
 from testing import assert_equal
 
-# ANCHOR: pooling_layout_tensor
 alias TPB = 8
 alias SIZE = 8
 alias BLOCKS_PER_GRID = (1, 1)
@@ -13,6 +12,7 @@ alias dtype = DType.float32
 alias layout = Layout.row_major(SIZE)
 
 
+# ANCHOR: pooling_layout_tensor_solution
 fn pooling[
     layout: Layout
 ](
@@ -25,10 +25,27 @@ fn pooling[
 
     global_i = block_dim.x * block_idx.x + thread_idx.x
     local_i = thread_idx.x
-    # FIX ME IN (roughly 10 lines)
+
+    # Load data into shared memory
+    if global_i < size:
+        shared[local_i] = a[global_i]
+
+    # Synchronize threads within block
+    barrier()
+
+    # Handle first two special cases
+    if global_i == 0:
+        output[0] = shared[0]
+    elif global_i == 1:
+        output[1] = shared[0] + shared[1]
+    # Handle general case
+    elif 1 < global_i < size:
+        output[global_i] = (
+            shared[local_i - 2] + shared[local_i - 1] + shared[local_i]
+        )
 
 
-# ANCHOR_END: pooling_layout_tensor
+# ANCHOR_END: pooling_layout_tensor_solution
 
 
 def main():

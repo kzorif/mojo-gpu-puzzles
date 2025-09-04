@@ -5,7 +5,7 @@ from layout import Layout, LayoutTensor
 from sys import argv
 from testing import assert_equal, assert_almost_equal
 
-# ANCHOR: neighbor_difference
+
 alias SIZE = WARP_SIZE
 alias BLOCKS_PER_GRID = (1, 1)
 alias THREADS_PER_BLOCK = (WARP_SIZE, 1)
@@ -13,6 +13,7 @@ alias dtype = DType.float32
 alias layout = Layout.row_major(SIZE)
 
 
+# ANCHOR: neighbor_difference_solution
 fn neighbor_difference[
     layout: Layout, size: Int
 ](
@@ -27,18 +28,34 @@ fn neighbor_difference[
     global_i = block_dim.x * block_idx.x + thread_idx.x
     lane = lane_id()
 
-    # FILL IN (roughly 7 lines)
+    if global_i < size:
+        # Get current value
+        current_val = input[global_i]
+
+        # Get next neighbor's value using shuffle_down
+        next_val = shuffle_down(current_val, 1)
+
+        # Compute difference - valid within warp boundaries
+        # Last lane of each warp has no valid neighbor within the warp
+        # Note there's only one warp in this test, so we don't need to check global_i < size - 1
+        # We'll see how this works with multiple blocks in the next tests
+        if lane < WARP_SIZE - 1:
+            output[global_i] = next_val - current_val
+        else:
+            # Last thread in warp or last thread overall, set to 0
+            output[global_i] = 0
 
 
-# ANCHOR_END: neighbor_difference
+# ANCHOR_END: neighbor_difference_solution
 
-# ANCHOR: moving_average_3
+# Advanced setup for multi-block patterns
 alias SIZE_2 = 64
 alias BLOCKS_PER_GRID_2 = (2, 1)
 alias THREADS_PER_BLOCK_2 = (WARP_SIZE, 1)
 alias layout_2 = Layout.row_major(SIZE_2)
 
 
+# ANCHOR: moving_average_3_solution
 fn moving_average_3[
     layout: Layout, size: Int
 ](
@@ -53,13 +70,27 @@ fn moving_average_3[
     global_i = block_dim.x * block_idx.x + thread_idx.x
     lane = lane_id()
 
-    # FILL IN (roughly 10 lines)
+    if global_i < size:
+        # Get current, next, and next+1 values
+        current_val = input[global_i]
+        next_val = shuffle_down(current_val, 1)
+        next_next_val = shuffle_down(current_val, 2)
+
+        # Compute 3-point average - valid within warp boundaries
+        if lane < WARP_SIZE - 2 and global_i < size - 2:
+            output[global_i] = (current_val + next_val + next_next_val) / 3.0
+        elif lane < WARP_SIZE - 1 and global_i < size - 1:
+            # Second-to-last in warp: only current + next available
+            output[global_i] = (current_val + next_val) / 2.0
+        else:
+            # Last thread in warp or boundary cases: only current available
+            output[global_i] = current_val
 
 
-# ANCHOR_END: moving_average_3
+# ANCHOR_END: moving_average_3_solution
 
 
-# ANCHOR: broadcast_shuffle_coordination
+# ANCHOR: broadcast_shuffle_coordination_solution
 fn broadcast_shuffle_coordination[
     layout: Layout, size: Int
 ](
@@ -73,16 +104,39 @@ fn broadcast_shuffle_coordination[
     """
     global_i = block_dim.x * block_idx.x + thread_idx.x
     lane = lane_id()
+
     if global_i < size:
+        # Step 1: Lane 0 computes block-local scaling factor
         var scale_factor: output.element_type = 0.0
+        if lane == 0:
+            # Compute average of first 4 elements in this block's data
+            block_start = block_idx.x * block_dim.x
+            var sum: output.element_type = 0.0
+            for i in range(4):
+                if block_start + i < size:
+                    sum += input[block_start + i]
+            scale_factor = sum / 4.0
 
-        # FILL IN (roughly 14 lines)
+        # Step 2: Broadcast scaling factor to all lanes in this warp
+        scale_factor = broadcast(scale_factor)
+
+        # Step 3: Each lane gets current and next values
+        current_val = input[global_i]
+        next_val = shuffle_down(current_val, 1)
+
+        # Step 4: Apply broadcast factor with neighbor coordination
+        if lane < WARP_SIZE - 1 and global_i < size - 1:
+            # Combine current + next, then scale by broadcast factor
+            output[global_i] = (current_val + next_val) * scale_factor
+        else:
+            # Last lane in warp or last element: only current value, scaled by broadcast factor
+            output[global_i] = current_val * scale_factor
 
 
-# ANCHOR_END: broadcast_shuffle_coordination
+# ANCHOR_END: broadcast_shuffle_coordination_solution
 
 
-# ANCHOR: basic_broadcast
+# ANCHOR: basic_broadcast_solution
 fn basic_broadcast[
     layout: Layout, size: Int
 ](
@@ -95,16 +149,29 @@ fn basic_broadcast[
     """
     global_i = block_dim.x * block_idx.x + thread_idx.x
     lane = lane_id()
+
     if global_i < size:
+        # Step 1: Lane 0 computes special value (sum of first 4 elements in this block)
         var broadcast_value: output.element_type = 0.0
+        if lane == 0:
+            block_start = block_idx.x * block_dim.x
+            var sum: output.element_type = 0.0
+            for i in range(4):
+                if block_start + i < size:
+                    sum += input[block_start + i]
+            broadcast_value = sum
 
-        # FILL IN (roughly 10 lines)
+        # Step 2: Broadcast lane 0's value to all lanes in this warp
+        broadcast_value = broadcast(broadcast_value)
+
+        # Step 3: All lanes use broadcast value in their computation
+        output[global_i] = broadcast_value + input[global_i]
 
 
-# ANCHOR_END: basic_broadcast
+# ANCHOR_END: basic_broadcast_solution
 
 
-# ANCHOR: conditional_broadcast
+# ANCHOR: conditional_broadcast_solution
 fn conditional_broadcast[
     layout: Layout, size: Int
 ](
@@ -117,11 +184,23 @@ fn conditional_broadcast[
     """
     global_i = block_dim.x * block_idx.x + thread_idx.x
     lane = lane_id()
+
     if global_i < size:
+        # Step 1: Lane 0 analyzes block-local data and makes decision (find max of first 8 in block)
         var decision_value: output.element_type = 0.0
+        if lane == 0:
+            block_start = block_idx.x * block_dim.x
+            decision_value = input[block_start] if block_start < size else 0.0
+            for i in range(1, min(8, min(WARP_SIZE, size - block_start))):
+                if block_start + i < size:
+                    current_val = input[block_start + i]
+                    if current_val > decision_value:
+                        decision_value = current_val
 
-        # FILL IN (roughly 10 lines)
+        # Step 2: Broadcast decision to all lanes in this warp
+        decision_value = broadcast(decision_value)
 
+        # Step 3: All lanes apply conditional logic based on broadcast decision
         current_input = input[global_i]
         threshold = decision_value / 2.0
         if current_input >= threshold:
@@ -130,7 +209,7 @@ fn conditional_broadcast[
             output[global_i] = current_input / 2.0  # Halve if < threshold
 
 
-# ANCHOR_END: conditional_broadcast
+# ANCHOR_END: conditional_broadcast_solution
 
 
 def test_neighbor_difference():
@@ -410,7 +489,7 @@ def test_conditional_broadcast():
 
 def main():
     print("WARP_SIZE: ", WARP_SIZE)
-    if len(argv()) < 1 or len(argv()) > 2:
+    if len(argv()) != 2:
         print(
             "Usage: p23.mojo"
             " [--neighbor|--average|--broadcast-basic|--broadcast-conditional|--broadcast-shuffle-coordination]"

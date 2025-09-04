@@ -5,7 +5,6 @@ from gpu.memory import AddressSpace
 from sys import size_of
 from testing import assert_equal
 
-# ANCHOR: dot_product
 alias TPB = 8
 alias SIZE = 8
 alias BLOCKS_PER_GRID = (1, 1)
@@ -13,17 +12,49 @@ alias THREADS_PER_BLOCK = (TPB, 1)
 alias dtype = DType.float32
 
 
+# ANCHOR: dot_product_solution
 fn dot_product(
     output: UnsafePointer[Scalar[dtype]],
     a: UnsafePointer[Scalar[dtype]],
     b: UnsafePointer[Scalar[dtype]],
     size: Int,
 ):
-    # FILL ME IN (roughly 13 lines)
-    ...
+    shared = stack_allocation[
+        TPB,
+        Scalar[dtype],
+        address_space = AddressSpace.SHARED,
+    ]()
+    global_i = block_dim.x * block_idx.x + thread_idx.x
+    local_i = thread_idx.x
+    if global_i < size:
+        shared[local_i] = a[global_i] * b[global_i]
+
+    barrier()
+
+    # The following causes race condition: all threads writing to the same location
+    # out[0] += shared[local_i]
+
+    # Instead can do parallel reduction in shared memory as opposed to
+    # global memory which has no guarantee on synchronization.
+    # Loops using global memory can cause thread divergence because
+    # fundamentally GPUs execute threads in warps (groups of 32 threads typically)
+    # and warps can be scheduled independently.
+    # However, shared memory does not have such issues as long as we use `barrier()`
+    # correctly when we're in the same thread block.
+    stride = TPB // 2
+    while stride > 0:
+        if local_i < stride:
+            shared[local_i] += shared[local_i + stride]
+
+        barrier()
+        stride //= 2
+
+    # only thread 0 writes the final result
+    if local_i == 0:
+        output[0] = shared[0]
 
 
-# ANCHOR_END: dot_product
+# ANCHOR_END: dot_product_solution
 
 
 def main():

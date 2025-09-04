@@ -20,7 +20,6 @@ from benchmark import (
     run,
 )
 
-# ANCHOR: traditional_approach_from_p12
 alias SIZE = WARP_SIZE
 alias BLOCKS_PER_GRID = (1, 1)
 alias THREADS_PER_BLOCK = (WARP_SIZE, 1)  # optimal choice for warp kernel
@@ -30,7 +29,8 @@ alias in_layout = Layout.row_major(SIZE)
 alias out_layout = Layout.row_major(1)
 
 
-fn traditional_dot_product_p12_style[
+# ANCHOR: traditional_approach_from_p10
+fn traditional_dot_product_p10_style[
     in_layout: Layout, out_layout: Layout, size: Int
 ](
     output: LayoutTensor[mut=True, dtype, out_layout],
@@ -38,7 +38,7 @@ fn traditional_dot_product_p12_style[
     b: LayoutTensor[mut=False, dtype, in_layout],
 ):
     """
-    This is the complex approach from p12_layout_tensor.mojo - kept for comparison.
+    This is the complex approach from p10_layout_tensor.mojo - kept for comparison.
     """
     shared = tb[dtype]().row_major[WARP_SIZE]().shared().alloc()
     global_i = block_dim.x * block_idx.x + thread_idx.x
@@ -62,12 +62,10 @@ fn traditional_dot_product_p12_style[
         output[0] = shared[0]
 
 
-# ANCHOR_END: traditional_approach_from_p12
-
-# ANCHOR: simple_warp_kernel
-from gpu.warp import sum as warp_sum
+# ANCHOR_END: traditional_approach_from_p10
 
 
+# ANCHOR: simple_warp_kernel_solution
 fn simple_warp_dot_product[
     in_layout: Layout, out_layout: Layout, size: Int
 ](
@@ -76,13 +74,24 @@ fn simple_warp_dot_product[
     b: LayoutTensor[mut=False, dtype, in_layout],
 ):
     global_i = block_dim.x * block_idx.x + thread_idx.x
-    # FILL IN (6 lines at most)
+
+    # Each thread computes one partial product using vectorized approach as values in Mojo are SIMD based
+    var partial_product: Scalar[dtype] = 0
+    if global_i < size:
+        partial_product = (a[global_i] * b[global_i]).reduce_add()
+
+    # warp_sum() replaces all the shared memory + barriers + tree reduction
+    total = warp_sum(partial_product)
+
+    # Only lane 0 writes the result (all lanes have the same total)
+    if lane_id() == 0:
+        output[0] = total
 
 
-# ANCHOR_END: simple_warp_kernel
+# ANCHOR_END: simple_warp_kernel_solution
 
 
-# ANCHOR: functional_warp_approach
+# ANCHOR: functional_warp_approach_solution
 fn functional_warp_dot_product[
     layout: Layout, dtype: DType, simd_width: Int, rank: Int, size: Int
 ](
@@ -99,14 +108,28 @@ fn functional_warp_dot_product[
         simd_width: Int, rank: Int, alignment: Int = align_of[dtype]()
     ](indices: IndexList[rank]) capturing -> None:
         idx = indices[0]
-        print("idx:", idx)
-        # FILL IN (10 lines at most)
+
+        # Each thread computes one partial product
+        var partial_product: Scalar[dtype] = 0.0
+        if idx < size:
+            a_val = a.load[1](idx, 0)
+            b_val = b.load[1](idx, 0)
+            partial_product = (a_val * b_val).reduce_add()
+        else:
+            partial_product = 0.0
+
+        # Warp magic - combines all WARP_SIZE partial products!
+        total = warp_sum(partial_product)
+
+        # Only lane 0 writes the result (all lanes have the same total)
+        if lane_id() == 0:
+            output.store[1](0, 0, total)
 
     # Launch exactly WARP_SIZE threads (one warp) to process all elements
     elementwise[compute_dot_product, 1, target="gpu"](WARP_SIZE, ctx)
 
 
-# ANCHOR_END: functional_warp_approach
+# ANCHOR_END: functional_warp_approach_solution
 
 
 @parameter
@@ -172,13 +195,13 @@ fn benchmark_functional_warp_parameterized[
         b_tensor = LayoutTensor[mut=False, dtype, test_layout](
             b_buf.unsafe_ptr()
         )
-        out_tensor = LayoutTensor[mut=True, dtype, Layout.row_major(1)](
+        output_tensor = LayoutTensor[mut=True, dtype, Layout.row_major(1)](
             out.unsafe_ptr()
         )
 
         functional_warp_dot_product[
             test_layout, dtype, SIMD_WIDTH, 1, test_size
-        ](out_tensor, a_tensor, b_tensor, ctx)
+        ](output_tensor, a_tensor, b_tensor, ctx)
         keep(out.unsafe_ptr())
         keep(a.unsafe_ptr())
         keep(b_buf.unsafe_ptr())
@@ -211,7 +234,7 @@ fn benchmark_traditional_parameterized[test_size: Int](mut b: Bencher) raises:
         b_tensor = LayoutTensor[dtype, test_layout](b_buf.unsafe_ptr())
 
         ctx.enqueue_function[
-            traditional_dot_product_p12_style[
+            traditional_dot_product_p10_style[
                 test_layout, out_layout, test_size
             ]
         ](
@@ -250,7 +273,7 @@ def main():
         print("SIMD_WIDTH:", SIMD_WIDTH)
         if argv()[1] == "--traditional":
             ctx.enqueue_function[
-                traditional_dot_product_p12_style[in_layout, out_layout, SIZE]
+                traditional_dot_product_p10_style[in_layout, out_layout, SIZE]
             ](
                 out_tensor,
                 a_tensor,
@@ -367,7 +390,7 @@ def main():
             print(bench)
             print("Benchmarks completed!")
             print()
-            print("🚀 WARP OPERATIONS PERFORMANCE ANALYSIS:")
+            print("WARP OPERATIONS PERFORMANCE ANALYSIS:")
             print(
                 "   GPU Architecture: NVIDIA (WARP_SIZE=32) vs AMD"
                 " (WARP_SIZE=64)"
@@ -411,23 +434,3 @@ def main():
             print("out:", out_host[0])
             print("expected:", expected[0])
             assert_equal(out_host[0], expected[0])
-
-        if len(argv()) == 1 or argv()[1] == "--kernel":
-            print()
-            print(
-                "🚀 Notice how simple the warp version is compared to p10.mojo!"
-            )
-            print(
-                "   Same kernel structure, but warp_sum() replaces all the"
-                " complexity!"
-            )
-        elif argv()[1] == "--functional":
-            print()
-            print(
-                "🔧 Functional approach shows modern Mojo style with warp"
-                " operations!"
-            )
-            print(
-                "   Clean, composable, and still leverages warp hardware"
-                " primitives!"
-            )

@@ -3,7 +3,6 @@ from gpu.host import DeviceContext, HostBuffer
 from layout import Layout, LayoutTensor
 from testing import assert_equal
 
-# ANCHOR: broadcast_add_layout_tensor
 alias SIZE = 2
 alias BLOCKS_PER_GRID = 1
 alias THREADS_PER_BLOCK = (3, 3)
@@ -13,6 +12,7 @@ alias a_layout = Layout.row_major(1, SIZE)
 alias b_layout = Layout.row_major(SIZE, 1)
 
 
+# ANCHOR: broadcast_add_layout_tensor_solution
 fn broadcast_add[
     out_layout: Layout,
     a_layout: Layout,
@@ -25,10 +25,13 @@ fn broadcast_add[
 ):
     row = thread_idx.y
     col = thread_idx.x
-    # FILL ME IN (roughly 2 lines)
+    if row < size and col < size:
+        output[row, col] = a[0, col] + b[row, 0]
 
 
-# ANCHOR_END: broadcast_add_layout_tensor
+# ANCHOR_END: broadcast_add_layout_tensor_solution
+
+
 def main():
     with DeviceContext() as ctx:
         out_buf = ctx.enqueue_create_buffer[dtype](SIZE * SIZE).enqueue_fill(0)

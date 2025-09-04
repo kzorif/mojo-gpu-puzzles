@@ -1,11 +1,8 @@
-from testing import assert_equal
-from gpu.host import DeviceContext
-
-# ANCHOR: dot_product_layout_tensor
 from gpu import thread_idx, block_idx, block_dim, barrier
+from gpu.host import DeviceContext
 from layout import Layout, LayoutTensor
 from layout.tensor_builder import LayoutTensorBuild as tb
-
+from testing import assert_equal
 
 alias TPB = 8
 alias SIZE = 8
@@ -16,6 +13,7 @@ alias layout = Layout.row_major(SIZE)
 alias out_layout = Layout.row_major(1)
 
 
+# ANCHOR: dot_product_layout_tensor_solution
 fn dot_product[
     in_layout: Layout, out_layout: Layout
 ](
@@ -24,11 +22,32 @@ fn dot_product[
     b: LayoutTensor[mut=True, dtype, in_layout],
     size: Int,
 ):
-    # FILL ME IN (roughly 13 lines)
-    ...
+    shared = tb[dtype]().row_major[TPB]().shared().alloc()
+    global_i = block_dim.x * block_idx.x + thread_idx.x
+    local_i = thread_idx.x
+
+    # Compute element-wise multiplication into shared memory
+    if global_i < size:
+        shared[local_i] = a[global_i] * b[global_i]
+
+    # Synchronize threads within block
+    barrier()
+
+    # Parallel reduction in shared memory
+    stride = TPB // 2
+    while stride > 0:
+        if local_i < stride:
+            shared[local_i] += shared[local_i + stride]
+
+        barrier()
+        stride //= 2
+
+    # Only thread 0 writes the final result
+    if local_i == 0:
+        output[0] = shared[0]
 
 
-# ANCHOR_END: dot_product_layout_tensor
+# ANCHOR_END: dot_product_layout_tensor_solution
 
 
 def main():

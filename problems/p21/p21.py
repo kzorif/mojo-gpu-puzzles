@@ -3,10 +3,8 @@ import torch
 from pathlib import Path
 from max.torch import CustomOpLibrary
 
-
 mojo_kernels = Path(__file__).parent / "op"
 ops = CustomOpLibrary(mojo_kernels)
-
 
 def embedding_mojo_1d(indices: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     """1D coalesced embedding kernel"""
